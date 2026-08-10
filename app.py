@@ -340,7 +340,7 @@ elif pagina == "📁 Minhas Patentes":
         
         st.divider()
         
-        st.subheading("💰 Registrar Pagamento / Marcar Anuidade")
+        st.subheader("💰 Registrar Pagamento / Marcar Anuidade")
         
         col1, col2, col3, col4 = st.columns(4)
         
