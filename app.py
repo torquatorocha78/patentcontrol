@@ -410,7 +410,7 @@ elif pagina == "📤 Importar Excel":
             with st.spinner("Importando dados..."):
                 resultados = db.importar_excel(arquivo_excel)
             
-            st.subheading("📊 Resultado da Importacao")
+            st.subheader("📊 Resultado da Importação")
             
             sucesso_count = sum(1 for _, sucesso, _ in resultados if sucesso)
             erro_count = len(resultados) - sucesso_count
