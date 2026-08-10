@@ -280,7 +280,7 @@ elif pagina == "📁 Minhas Patentes":
         
         st.divider()
         
-        st.subheading("📊 Detalhamento de Anuidades")
+        st.subheader("📊 Detalhamento de Anuidades")
         
         anuidades = db.obter_anuidades(patente_id)
         
