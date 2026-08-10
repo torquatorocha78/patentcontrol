@@ -466,7 +466,7 @@ elif pagina == "🤖 Análise IA":
         
         st.divider()
         
-        st.subheading("📊 Análises Rápidas")
+        st.subheader("📊 Análises Rápidas")
         
         col1, col2, col3 = st.columns(3)
         
@@ -493,7 +493,7 @@ elif pagina == "📄 Gerar Relatórios":
     if len(df_patentes) == 0:
         st.warning("⚠️ Nenhuma patente cadastrada. Primeiro, adicione algumas patentes.")
     else:
-        st.subheading("Escolha o tipo de relatório:")
+        st.subheader("Escolha o tipo de relatório:")
         
         col1, col2, col3 = st.columns(3)
         
@@ -532,7 +532,7 @@ elif pagina == "📄 Gerar Relatórios":
         
         st.divider()
         
-        st.subheading("📊 Exportação de Dados")
+        st.subheader("📊 Exportação de Dados")
         
         col1, col2 = st.columns(2)
         
