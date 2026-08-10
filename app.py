@@ -92,7 +92,7 @@ if pagina == "📊 Dashboard":
         
         st.divider()
         
-        st.subheading("Resumo de Patentes")
+        st.subheader("Resumo de Patentes")
         
         dados_dashboard = []
         for _, patente in df_patentes.iterrows():
