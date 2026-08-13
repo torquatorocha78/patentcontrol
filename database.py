@@ -1,546 +1,635 @@
-# database.py
-import sqlite3
+import streamlit as st
 import pandas as pd
-from datetime import date
-import unicodedata
+from datetime import datetime
+from dateutil.relativedelta import relativedelta
+import database as db
+import utils
+import ai_analyzer
+import report_generator
 
-DB_NAME = "patentes.db"
+st.set_page_config(
+    page_title="Gestão de Patentes do IFSC",
+    page_icon="📋",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-
-def conectar():
-    return sqlite3.connect(DB_NAME, check_same_thread=False)
-
-
-def init_database():
-    conn = conectar()
-    cur = conn.cursor()
-
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS patentes (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        numero_patente TEXT UNIQUE,
-        data_deposito DATE,
-        data_concessao DATE,
-        descricao TEXT,
-        titular TEXT,
-        gestor TEXT,
-        status TEXT
-    )
-    """)
-
-    colunas_existentes = {
-        row[1] for row in cur.execute("PRAGMA table_info(patentes)").fetchall()
-    }
-    novas_colunas = {
-        "titulo": "TEXT",
-        "inventores": "TEXT",
-        "campus": "TEXT",
-        "atributos": "TEXT",
-    }
-    for coluna, tipo in novas_colunas.items():
-        if coluna not in colunas_existentes:
-            cur.execute(f"ALTER TABLE patentes ADD COLUMN {coluna} {tipo}")
-
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS anuidades (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        patente_id INTEGER,
-        numero_anuidade INTEGER,
-        data_inicio_ordinario DATE,
-        data_fim_ordinario DATE,
-        data_inicio_extraordinario DATE,
-        data_fim_extraordinario DATE,
-        data_pagamento DATE,
-        status TEXT,
-        FOREIGN KEY (patente_id) REFERENCES patentes(id)
-    )
-    """)
-
-    conn.commit()
-    conn.close()
-    garantir_anuidades_existentes()
+db.init_database()
 
 
-def obter_patentes():
-    conn = conectar()
-    df = pd.read_sql("SELECT * FROM patentes ORDER BY id", conn)
-    conn.close()
-    return df
-
-
-def _valor_limpo(valor):
-    if pd.isna(valor):
+def data_para_input(valor):
+    if valor is None or pd.isna(valor) or valor == "":
         return None
-    if isinstance(valor, str):
-        valor = valor.strip()
-        return valor or None
-    return valor
-
-
-def _normalizar_coluna(coluna):
-    texto = str(coluna).strip().lower()
-    texto = "".join(
-        c for c in unicodedata.normalize("NFKD", texto)
-        if not unicodedata.combining(c)
-    )
-    for char in ["/", "\\", "-", ".", "(", ")", ":", ";"]:
-        texto = texto.replace(char, " ")
-    return "_".join(texto.split())
-
-
-def _normalizar_status(status):
-    status = _valor_limpo(status)
-    if not status:
-        return "Ativo"
-
-    status_texto = str(status).strip()
-    chave = _normalizar_coluna(status_texto)
-    mapa = {
-        "patente_concedida": "Patente Concedida",
-        "patente_concedda": "Patente Concedida",
-        "concedido": "Patente Concedida",
-        "tramitando_normal": "Tramitando Normal",
-        "infederimento": "Indeferimento",
-        "indeferimento": "Indeferimento",
-        "recurso_contra_indeferimento": "Recurso contra indeferimento",
-        "pedido_de_exame": "Pedido de exame",
-        "transferida_a_titularidade": "Transferida a titularidade",
-    }
-    return mapa.get(chave, status_texto)
-
-
-def _parse_data(valor):
-    valor = _valor_limpo(valor)
-    if valor is None:
-        return None
-    if hasattr(valor, "date") and not isinstance(valor, str):
-        return valor.date().isoformat()
-
-    texto = str(valor).strip()
-    if not texto:
-        return None
-
     try:
-        partes = texto.replace("-", "/").split("/")
-        if len(partes) == 3 and all(p.isdigit() for p in partes):
-            primeiro, segundo = int(partes[0]), int(partes[1])
-            dayfirst = primeiro > 12 or segundo <= 12
-            data = pd.to_datetime(texto, dayfirst=dayfirst, errors="raise")
-        else:
-            data = pd.to_datetime(texto, dayfirst=True, errors="raise")
-        return data.date().isoformat()
+        return pd.to_datetime(valor).date()
     except Exception:
-        return texto
+        return None
 
 
-def adicionar_patente(
-    numero,
-    data_dep,
-    data_conc,
-    descricao,
-    titular,
-    gestor=None,
-    status_patente='Ativo',
-    titulo=None,
-    inventores=None,
-    campus=None,
-    atributos=None,
-):
-    """
-    Agora aceita gestor e status. Insere patentes e gera anuidades.
-    """
-    conn = conectar()
-    cur = conn.cursor()
+def texto(valor):
+    if valor is None or pd.isna(valor):
+        return ""
+    return str(valor)
 
-    try:
-        cur.execute(
-            """
-            INSERT INTO patentes
-            (numero_patente, data_deposito, data_concessao, descricao, titular, gestor, status,
-             titulo, inventores, campus, atributos)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                numero,
-                data_dep,
-                data_conc,
-                descricao,
-                titular,
-                gestor,
-                _normalizar_status(status_patente),
-                titulo,
-                inventores,
-                campus,
-                atributos,
-            ),
-        )
-        patente_id = cur.lastrowid
+st.markdown("""
+<style>
+    .status-verde { color: #00CC00; font-weight: bold; }
+    .status-amarelo { color: #FFCC00; font-weight: bold; }
+    .status-vermelho { color: #FF0000; font-weight: bold; }
+    .status-pago { color: #0099FF; font-weight: bold; }
+    .title-ifsc { text-align: center; color: #003366; }
+</style>
+""", unsafe_allow_html=True)
 
-        inicio = pd.to_datetime(data_dep)
-        for i in range(1, 21):
-            ini_ord = inicio + pd.DateOffset(years=i - 1)
-            fim_ord = ini_ord + pd.DateOffset(months=3)
-            ini_ext = fim_ord
-            fim_ext = ini_ext + pd.DateOffset(months=3)
+# Logo e Título Principal
+st.markdown('<h1 class="title-ifsc">🏛️ Gestão de Patentes do IFSC</h1>', unsafe_allow_html=True)
+st.markdown('<p style="text-align: center; color: #666;">Instituto Federal de Educação, Ciência e Tecnologia de Santa Catarina</p>', unsafe_allow_html=True)
+st.divider()
 
-            # status padrão das anuidades: 'pendente'
-            cur.execute(
-                """
-                INSERT INTO anuidades
-                (patente_id, numero_anuidade,
-                 data_inicio_ordinario, data_fim_ordinario,
-                 data_inicio_extraordinario, data_fim_extraordinario,
-                 status)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    patente_id,
-                    i,
-                    ini_ord.date(),
-                    fim_ord.date(),
-                    ini_ext.date(),
-                    fim_ext.date(),
-                    "pendente",
-                ),
+st.sidebar.title("⚙️ Navegação")
+pagina = st.sidebar.radio("Selecione uma página:", 
+    ["📊 Dashboard", "➕ Adicionar Patente", "📁 Minhas Patentes", "📤 Importar Excel", "🤖 Análise IA", "📄 Gerar Relatórios"])
+
+if pagina == "📊 Dashboard":
+    st.title("📊 Dashboard de Patentes")
+    
+    df_patentes = db.obter_patentes()
+    
+    if len(df_patentes) == 0:
+        st.info("📭 Nenhuma patente cadastrada ainda. Adicione uma patente para começar!")
+    else:
+        total_patentes = len(df_patentes)
+
+        hoje = datetime.now().date()
+
+        def data_anuidade(valor):
+            try:
+                return pd.to_datetime(valor).date()
+            except Exception:
+                return None
+
+        def dados_prazo_ordinario(anu):
+            if anu['status'] == 'nao_pagar' or anu['data_pagamento']:
+                return None
+
+            inicio_ord = data_anuidade(anu['data_inicio_ordinario'])
+            fim_ord = data_anuidade(anu['data_fim_ordinario'])
+            if not inicio_ord or not fim_ord or not (inicio_ord <= hoje <= fim_ord):
+                return None
+
+            dias_restantes = (fim_ord - hoje).days
+            status = 'amarelo' if dias_restantes <= 30 else 'verde'
+            return status, dias_restantes
+
+        dados_dashboard = []
+
+        for _, patente in df_patentes.iterrows():
+            anuidades = db.obter_anuidades(patente['id'])
+            for _, anu in anuidades.iterrows():
+                prazo = dados_prazo_ordinario(anu)
+                if not prazo:
+                    continue
+
+                status, dias_restantes = prazo
+                emoji = utils.criar_emoji_status(status)
+                dados_dashboard.append({
+                    "ID": patente['id'],
+                    "Patente": patente['numero_patente'],
+                    "Título": patente.get('titulo') or "-",
+                    "Deposito": utils.formatar_data(patente['data_deposito']),
+                    "Status": f"{emoji} {status.upper()}",
+                    "Anuidade": anu['numero_anuidade'],
+                    "Fim Prazo Ordinário": utils.formatar_data(anu['data_fim_ordinario']),
+                    "Dias p/ Vencer": dias_restantes,
+                    "Gestor": patente.get('gestor', 'N/A'),
+                    "Campus": patente.get('campus') or "-"
+                })
+
+        alertas_verde = sum(1 for item in dados_dashboard if '✅' in item["Status"])
+        alertas_amarelo = sum(1 for item in dados_dashboard if '⚠️' in item["Status"])
+
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            st.metric("📚 Total de Patentes", total_patentes)
+        
+        with col2:
+            st.metric("📅 Em Prazo Ordinário", len(dados_dashboard))
+        
+        with col3:
+            st.metric("✅ Normal", alertas_verde, delta="green")
+        
+        with col4:
+            st.metric("⚠️ Atenção", alertas_amarelo, delta="orange")
+        
+        st.divider()
+        
+        st.subheader("Anuidades em Prazo Ordinário")
+        
+        df_dashboard = pd.DataFrame(dados_dashboard)
+        
+        def colorir_status(row):
+            if '⚠️' in str(row['Status']):
+                return ['background-color: #ffffcc'] * len(row)
+            elif '✅' in str(row['Status']):
+                return ['background-color: #ccffcc'] * len(row)
+            else:
+                return [''] * len(row)
+
+        if df_dashboard.empty:
+            st.info("Nenhuma anuidade está em prazo ordinário neste momento.")
+        else:
+            df_dashboard = df_dashboard.sort_values("Dias p/ Vencer")
+            st.dataframe(
+                df_dashboard.style.apply(colorir_status, axis=1),
+                use_container_width=True,
+                hide_index=True
             )
 
-        conn.commit()
-        return True, "Patente cadastrada com sucesso"
+elif pagina == "➕ Adicionar Patente":
+    st.title("➕ Adicionar Nova Patente")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        numero_patente = st.text_input(
+            "Numero da Patente",
+            placeholder="Ex: BR1020220000001",
+            help="Identificador unico da patente"
+        )
 
-    except Exception as e:
-        return False, str(e)
-    finally:
-        conn.close()
+        titulo = st.text_input(
+            "Título",
+            placeholder="Título da patente"
+        )
+        
+        data_deposito = st.date_input(
+            "Data do Deposito",
+            help="Data em que a patente foi depositada no INPI"
+        )
+        
+        gestor = st.text_input(
+            "Gestor (opcional)",
+            placeholder="Ex: IFSC, Empresa XYZ",
+            help="Responsável pela gestão da patente"
+        )
+    
+    with col2:
+        data_concessao = st.date_input(
+            "Data de Concessao (opcional)",
+            value=None,
+            help="Data em que a patente foi concedida"
+        )
+        
+        titular = st.text_input(
+            "Titular/Proprietario (opcional)",
+            placeholder="Ex: Empresa XYZ"
+        )
 
+        inventores = st.text_area(
+            "Nome dos Inventores (opcional)",
+            placeholder="Separe os nomes por / ou por linha",
+            height=90
+        )
+        
+        status_patente = st.selectbox(
+            "Status (opcional)",
+            ["Ativo", "Patente Concedida", "Tramitando Normal", "Indeferimento", "Recurso contra indeferimento", "Pedido de exame", "Arquivado", "Desistência"],
+            help="Status atual da patente"
+        )
 
-def _calcular_datas_anuidade(data_dep, numero_anuidade):
-    inicio = pd.to_datetime(data_dep)
-    ini_ord = inicio + pd.DateOffset(years=numero_anuidade - 1)
-    fim_ord = ini_ord + pd.DateOffset(months=3)
-    ini_ext = fim_ord
-    fim_ext = ini_ext + pd.DateOffset(months=3)
-    return ini_ord.date(), fim_ord.date(), ini_ext.date(), fim_ext.date()
-
-
-def _garantir_anuidades_patente(cur, patente_id, data_dep):
-    if not data_dep:
-        return
-
-    cur.execute(
-        "SELECT numero_anuidade FROM anuidades WHERE patente_id = ?",
-        (patente_id,),
+        campus = st.text_input(
+            "Campus (opcional)",
+            placeholder="Ex: Florianópolis, Joinville"
+        )
+    
+    descricao = st.text_area(
+        "Resumo/Descricao (opcional)",
+        placeholder="Descreva brevemente o objeto da patente",
+        height=100
     )
-    existentes = {row[0] for row in cur.fetchall()}
 
-    for numero_anuidade in range(1, 21):
-        if numero_anuidade in existentes:
-            continue
-
-        ini_ord, fim_ord, ini_ext, fim_ext = _calcular_datas_anuidade(
-            data_dep,
-            numero_anuidade,
-        )
-        cur.execute(
-            """
-            INSERT INTO anuidades
-            (patente_id, numero_anuidade,
-             data_inicio_ordinario, data_fim_ordinario,
-             data_inicio_extraordinario, data_fim_extraordinario,
-             status)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                patente_id,
-                numero_anuidade,
-                ini_ord,
-                fim_ord,
-                ini_ext,
-                fim_ext,
-                "pendente",
-            ),
-        )
-
-
-def garantir_anuidades_existentes():
-    conn = conectar()
-    cur = conn.cursor()
-
-    cur.execute("SELECT id, data_deposito FROM patentes")
-    patentes = cur.fetchall()
-
-    for patente_id, data_dep in patentes:
-        _garantir_anuidades_patente(cur, patente_id, data_dep)
-
-    conn.commit()
-    conn.close()
-
-
-def atualizar_patente(
-    patente_id,
-    numero,
-    data_dep,
-    data_conc,
-    descricao,
-    titular,
-    gestor=None,
-    status_patente="Ativo",
-    titulo=None,
-    inventores=None,
-    campus=None,
-    atributos=None,
-):
-    conn = conectar()
-    cur = conn.cursor()
-    try:
-        cur.execute(
-            """
-            UPDATE patentes
-            SET numero_patente = ?, data_deposito = ?, data_concessao = ?,
-                descricao = ?, titular = ?, gestor = ?, status = ?,
-                titulo = ?, inventores = ?, campus = ?, atributos = ?
-            WHERE id = ?
-            """,
-            (
-                numero,
-                data_dep,
-                data_conc,
+    atributos = st.text_area(
+        "Atributos (opcional)",
+        placeholder="Informações complementares ou classificações",
+        height=80
+    )
+    
+    st.divider()
+    
+    if st.button("✅ Adicionar Patente", use_container_width=True, type="primary"):
+        if not numero_patente or not data_deposito:
+            st.error("❌ Por favor, preencha pelo menos o Numero da Patente e a Data do Deposito.")
+        else:
+            data_dep_str = data_deposito.strftime("%Y-%m-%d")
+            data_conc_str = data_concessao.strftime("%Y-%m-%d") if data_concessao else None
+            
+            sucesso, mensagem = db.adicionar_patente(
+                numero_patente,
+                data_dep_str,
+                data_conc_str,
                 descricao,
                 titular,
                 gestor,
-                _normalizar_status(status_patente),
+                status_patente,
                 titulo,
                 inventores,
                 campus,
-                atributos,
-                patente_id,
-            ),
-        )
-        conn.commit()
-        return True, "Patente atualizada com sucesso"
-    except Exception as e:
-        return False, str(e)
-    finally:
-        conn.close()
+                atributos
+            )
+            
+            if sucesso:
+                st.success(f"✅ {mensagem}")
+                st.balloons()
+                
+                st.subheader("📅 Anuidades Calculadas")
+                
+                df_patentes = db.obter_patentes()
+                patente_id = df_patentes[df_patentes['numero_patente'] == numero_patente]['id'].values[0]
+                anuidades = db.obter_anuidades(patente_id)
+                
+                dados_anuidades = []
+                for _, anu in anuidades.iterrows():
+                    dados_anuidades.append({
+                        "Anuidade": anu['numero_anuidade'],
+                        "Inicio Ordinario": utils.formatar_data(anu['data_inicio_ordinario']),
+                        "Fim Ordinario": utils.formatar_data(anu['data_fim_ordinario']),
+                        "Inicio Extraordinario": utils.formatar_data(anu['data_inicio_extraordinario']),
+                        "Fim Extraordinario": utils.formatar_data(anu['data_fim_extraordinario'])
+                    })
+                
+                df_anuidades = pd.DataFrame(dados_anuidades)
+                st.dataframe(df_anuidades, use_container_width=True, hide_index=True)
+            else:
+                st.error(f"❌ {mensagem}")
 
-
-def salvar_patente_importada(dados):
-    conn = conectar()
-    cur = conn.cursor()
-    try:
-        cur.execute(
-            "SELECT id FROM patentes WHERE numero_patente = ?",
-            (dados["numero"],),
-        )
-        existente = cur.fetchone()
-    finally:
-        conn.close()
-
-    if existente:
-        ok, msg = atualizar_patente(existente[0], **dados)
-        return ok, "Atualizada: " + msg if ok else msg
-
-    ok, msg = adicionar_patente(**dados)
-    return ok, "Importada: " + msg if ok else msg
-
-
-def obter_anuidades(patente_id):
-    patente_id = int(patente_id)
-    conn = conectar()
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT data_deposito FROM patentes WHERE id = ?",
-        (patente_id,),
-    )
-    patente = cur.fetchone()
-    if patente:
-        _garantir_anuidades_patente(cur, patente_id, patente[0])
-        conn.commit()
-
-    df = pd.read_sql(
-        "SELECT * FROM anuidades WHERE patente_id = ? ORDER BY numero_anuidade",
-        conn,
-        params=(patente_id,),
-    )
-    conn.close()
-
-    hoje = date.today()
-
-    def normalizar_status(row):
-        # Mantemos o status explícito salvo no DB quando presente
-        if row.get("status"):
-            s = str(row["status"]).lower()
-            # Se já foi marcado 'nao_pagar' mantém
-            if s == "nao_pagar":
-                return "nao_pagar"
-            # se data_pagamento preenchida -> pago
-            if row.get("data_pagamento"):
-                return "pago"
-        # se chegou após o fim extraordinário consideramos pago/expirado
-        if row.get("data_fim_extraordinario"):
-            try:
-                if pd.to_datetime(row["data_fim_extraordinario"]).date() < hoje:
-                    return "pago"
-            except Exception:
-                pass
-        return "pendente"
-
-    df["status"] = df.apply(normalizar_status, axis=1)
-    return df
-
-
-def atualizar_status_anuidade(patente_id, numero_anuidade, novo_status, data_pagamento=None):
-    """
-    novo_status: 'pago' ou 'nao_pagar' ou 'pendente'
-    data_pagamento: string 'YYYY-MM-DD' ou None
-    Compatível com os usos em app.py.
-    """
-    patente_id = int(patente_id)
-    numero_anuidade = int(numero_anuidade)
-    conn = conectar()
-    cur = conn.cursor()
-
-    novo_status = novo_status.lower()
-
-    if novo_status == "pago":
-        cur.execute(
-            """
-            UPDATE anuidades
-            SET data_pagamento = ?, status = 'pago'
-            WHERE patente_id = ? AND numero_anuidade = ?
-            """,
-            (data_pagamento, patente_id, numero_anuidade),
-        )
-    elif novo_status == "nao_pagar":
-        cur.execute(
-            """
-            UPDATE anuidades
-            SET data_pagamento = NULL, status = 'nao_pagar'
-            WHERE patente_id = ? AND numero_anuidade = ?
-            """,
-            (patente_id, numero_anuidade),
-        )
+elif pagina == "📁 Minhas Patentes":
+    st.title("📁 Minhas Patentes")
+    
+    df_patentes = db.obter_patentes()
+    
+    if len(df_patentes) == 0:
+        st.info("📭 Nenhuma patente cadastrada. Va em 'Adicionar Patente' para começar.")
     else:
-        # apenas atualiza status
-        cur.execute(
-            """
-            UPDATE anuidades
-            SET status = ?
-            WHERE patente_id = ? AND numero_anuidade = ?
-            """,
-            (novo_status, patente_id, numero_anuidade),
-        )
+        busca = st.text_input("Buscar por número, título, inventor, gestor ou campus:")
+        df_filtrado = df_patentes.copy()
+        if busca:
+            termo = busca.lower()
+            colunas_busca = ["numero_patente", "titulo", "inventores", "gestor", "campus"]
+            mascara = pd.Series(False, index=df_filtrado.index)
+            for coluna in colunas_busca:
+                if coluna in df_filtrado:
+                    mascara = mascara | df_filtrado[coluna].fillna("").astype(str).str.lower().str.contains(termo, regex=False)
+            df_filtrado = df_filtrado[mascara]
 
-    conn.commit()
-    conn.close()
+        if len(df_filtrado) == 0:
+            st.warning("Nenhuma patente encontrada com esse filtro.")
+            st.stop()
 
-
-def deletar_patente(patente_id):
-    patente_id = int(patente_id)
-    conn = conectar()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM anuidades WHERE patente_id = ?", (patente_id,))
-    cur.execute("DELETE FROM patentes WHERE id = ?", (patente_id,))
-    conn.commit()
-    conn.close()
-
-
-def importar_excel(arquivo_excel):
-    """
-    Placeholder simples: implement conforme necessidade. Retorna lista de tuplas (patente, sucesso, mensagem)
-    """
-    resultados = []
-    try:
-        df = pd.read_excel(arquivo_excel)
-        colunas = {_normalizar_coluna(col): col for col in df.columns}
-
-        def campo(*nomes):
-            for nome in nomes:
-                coluna = colunas.get(_normalizar_coluna(nome))
-                if coluna is not None:
-                    return coluna
-            return None
-
-        mapa = {
-            "numero": campo("numero_patente", "número patente", "numero patente", "patente"),
-            "data_dep": campo("data_deposito", "data depósito", "data deposito"),
-            "data_conc": campo("data_concessao", "data_concessão", "data concessão", "data concessao"),
-            "titulo": campo("titulo", "título"),
-            "descricao": campo("resumo", "descricao", "descrição"),
-            "inventores": campo("nome dos inventores", "inventores", "nome_dos_inventores"),
-            "titular": campo("depositante titular", "depositante/ titular", "titular", "depositante"),
-            "gestor": campo("gestor"),
-            "status": campo("status do pedido", "status", "situacao", "situação"),
-            "campus": campo("campus"),
-            "atributos": campo("atributos", "atributo"),
+        opcoes = {
+            f"{row['numero_patente']} - {row.get('titulo') or 'Sem título'}": row['numero_patente']
+            for _, row in df_filtrado.iterrows()
         }
+        patente_label = st.selectbox("Selecione uma patente:", list(opcoes.keys()))
+        patente_selecionada = opcoes[patente_label]
+        
+        patente_dados = df_patentes[df_patentes['numero_patente'] == patente_selecionada].iloc[0]
+        patente_id = patente_dados['id']
+        
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("📝 Numero", patente_selecionada)
+        with col2:
+            st.metric("📅 Deposito", utils.formatar_data(patente_dados['data_deposito']))
+        with col3:
+            st.metric("✅ Concessao", utils.formatar_data(patente_dados['data_concessao']) if patente_dados['data_concessao'] else "Pendente")
+        with col4:
+            st.metric("👤 Titular", patente_dados['titular'] if patente_dados['titular'] else "N/A")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            st.metric("🔑 Gestor", patente_dados.get('gestor', 'N/A'))
+        with col2:
+            st.metric("📊 Status", patente_dados.get('status', 'Ativo'))
 
-        for _, row in df.iterrows():
-            numero = _valor_limpo(row.get(mapa["numero"])) if mapa["numero"] else None
-            data_dep = _parse_data(row.get(mapa["data_dep"])) if mapa["data_dep"] else None
+        col1, col2 = st.columns(2)
+        with col1:
+            st.metric("🏫 Campus", patente_dados.get('campus') if patente_dados.get('campus') else "N/A")
+        with col2:
+            st.metric("📌 Título", patente_dados.get('titulo') if patente_dados.get('titulo') else "Sem título")
 
-            if not numero or not data_dep:
-                resultados.append((numero or "SEM_NUMERO", False, "Número da patente ou data de depósito ausente"))
-                continue
+        if patente_dados.get('inventores'):
+            st.info(f"**Inventores:** {patente_dados['inventores']}")
 
-            dados = {
-                "numero": str(numero),
-                "data_dep": data_dep,
-                "data_conc": _parse_data(row.get(mapa["data_conc"])) if mapa["data_conc"] else None,
-                "descricao": _valor_limpo(row.get(mapa["descricao"])) if mapa["descricao"] else None,
-                "titular": _valor_limpo(row.get(mapa["titular"])) if mapa["titular"] else None,
-                "gestor": _valor_limpo(row.get(mapa["gestor"])) if mapa["gestor"] else None,
-                "status_patente": _normalizar_status(row.get(mapa["status"])) if mapa["status"] else "Ativo",
-                "titulo": _valor_limpo(row.get(mapa["titulo"])) if mapa["titulo"] else None,
-                "inventores": _valor_limpo(row.get(mapa["inventores"])) if mapa["inventores"] else None,
-                "campus": _valor_limpo(row.get(mapa["campus"])) if mapa["campus"] else None,
-                "atributos": _valor_limpo(row.get(mapa["atributos"])) if mapa["atributos"] else None,
-            }
-            ok, msg = salvar_patente_importada(dados)
-            resultados.append((numero, ok, msg))
-    except Exception as e:
-        resultados.append(("ERRO_GERAL", False, str(e)))
+        if patente_dados.get('atributos'):
+            st.info(f"**Atributos:** {patente_dados['atributos']}")
+        
+        if patente_dados['descricao']:
+            st.info(f"**Resumo/Descricao:** {patente_dados['descricao']}")
 
-    return resultados
+        st.divider()
 
+        with st.expander("✏️ Editar dados da patente"):
+            with st.form(f"form_editar_{patente_id}"):
+                col1, col2 = st.columns(2)
 
-def analisar_inconsistencias_excel(arquivo_excel):
-    df = pd.read_excel(arquivo_excel)
-    problemas = []
+                with col1:
+                    edit_numero = st.text_input("Número da Patente", value=texto(patente_dados.get('numero_patente')))
+                    edit_titulo = st.text_input("Título", value=texto(patente_dados.get('titulo')))
+                    edit_data_dep = st.date_input(
+                        "Data do Depósito",
+                        value=data_para_input(patente_dados.get('data_deposito'))
+                    )
+                    edit_data_conc = st.date_input(
+                        "Data de Concessão",
+                        value=data_para_input(patente_dados.get('data_concessao'))
+                    )
+                    edit_gestor = st.text_input("Gestor", value=texto(patente_dados.get('gestor')))
+                    edit_campus = st.text_input("Campus", value=texto(patente_dados.get('campus')))
 
-    colunas_originais = list(df.columns)
-    colunas_normalizadas = {_normalizar_coluna(col): col for col in colunas_originais}
-    if any(str(col) != str(col).strip() for col in colunas_originais):
-        problemas.append("Há cabeçalhos com espaços sobrando; o importador corrige isso automaticamente.")
+                with col2:
+                    edit_titular = st.text_area("Depositante/Titular", value=texto(patente_dados.get('titular')), height=90)
+                    edit_inventores = st.text_area("Nome dos Inventores", value=texto(patente_dados.get('inventores')), height=90)
+                    edit_status = st.text_input("Status do Pedido", value=texto(patente_dados.get('status')))
+                    edit_atributos = st.text_area("Atributos", value=texto(patente_dados.get('atributos')), height=90)
 
-    obrigatorias = ["numero_patente", "data_deposito"]
-    for obrigatoria in obrigatorias:
-        if _normalizar_coluna(obrigatoria) not in colunas_normalizadas:
-            problemas.append(f"Coluna obrigatória não encontrada: {obrigatoria}")
+                edit_descricao = st.text_area("Resumo/Descrição", value=texto(patente_dados.get('descricao')), height=130)
 
-    numero_col = colunas_normalizadas.get("numero_patente")
-    if numero_col:
-        vazios = df[df[numero_col].isna()].index.tolist()
-        duplicados = df[df[numero_col].duplicated(keep=False)][numero_col].dropna().unique().tolist()
-        if vazios:
-            problemas.append(f"{len(vazios)} linha(s) sem número de patente.")
-        if duplicados:
-            problemas.append(f"Números de patente duplicados: {', '.join(map(str, duplicados))}")
+                salvar = st.form_submit_button("💾 Salvar alterações", use_container_width=True, type="primary")
 
-    for nome in ["titulo", "resumo", "nome_dos_inventores", "depositante_titular"]:
-        col = colunas_normalizadas.get(nome)
-        if col:
-            vazios = int(df[col].isna().sum())
-            if vazios:
-                problemas.append(f"{vazios} linha(s) sem {col}.")
+                if salvar:
+                    if not edit_numero or not edit_data_dep:
+                        st.error("Preencha pelo menos o número da patente e a data do depósito.")
+                    else:
+                        ok, msg = db.atualizar_patente(
+                            patente_id,
+                            edit_numero,
+                            edit_data_dep.strftime("%Y-%m-%d") if edit_data_dep else None,
+                            edit_data_conc.strftime("%Y-%m-%d") if edit_data_conc else None,
+                            edit_descricao,
+                            edit_titular,
+                            edit_gestor,
+                            edit_status,
+                            edit_titulo,
+                            edit_inventores,
+                            edit_campus,
+                            edit_atributos
+                        )
+                        if ok:
+                            st.success(msg)
+                            st.rerun()
+                        else:
+                            st.error(msg)
+        
+        st.divider()
+        
+        st.subheader("📊 Detalhamento de Anuidades")
+        
+        anuidades = db.obter_anuidades(patente_id)
+        
+        if anuidades.empty:
+            st.warning("Nenhuma anuidade encontrada para esta patente. Verifique a data de depósito cadastrada.")
+        else:
+            dados_tabela = []
+            for _, anu in anuidades.iterrows():
+                if anu['status'] == 'nao_pagar':
+                    emoji = '⛔'
+                    status_display = 'NÃO PAGAR'
+                    dias_restantes = '-'
+                else:
+                    status = utils.calcular_status_anuidade(
+                        anu['data_inicio_ordinario'],
+                        anu['data_fim_ordinario'],
+                        anu['data_inicio_extraordinario'],
+                        anu['data_fim_extraordinario'],
+                        anu['data_pagamento']
+                    )
+                    
+                    dias_restantes = utils.obter_dias_restantes(
+                        anu['data_fim_ordinario'],
+                        anu['data_pagamento']
+                    )
+                    
+                    emoji = utils.criar_emoji_status(status)
+                    status_display = status.upper()
+                
+                dados_tabela.append({
+                    "Anuidade": anu['numero_anuidade'],
+                    "Inicio Ordinario": utils.formatar_data(anu['data_inicio_ordinario']),
+                    "Fim Ordinario": utils.formatar_data(anu['data_fim_ordinario']),
+                    "Dias Restantes": dias_restantes if dias_restantes != '-' else ("Pago" if anu['data_pagamento'] else '-'),
+                    "Status": f"{emoji} {status_display}",
+                    "Data Pagamento": utils.formatar_data(anu['data_pagamento']) if anu['data_pagamento'] else "-"
+                })
+            
+            df_tabela = pd.DataFrame(dados_tabela)
+            
+            def colorir_linhas(row):
+                if '⛔' in str(row['Status']):
+                    return ['background-color: #e6e6e6'] * len(row)
+                elif '❌' in str(row['Status']):
+                    return ['background-color: #ffcccc'] * len(row)
+                elif '⚠️' in str(row['Status']):
+                    return ['background-color: #ffffcc'] * len(row)
+                elif '✅' in str(row['Status']):
+                    return ['background-color: #ccffcc'] * len(row)
+                elif '💰' in str(row['Status']):
+                    return ['background-color: #ccddff'] * len(row)
+                else:
+                    return [''] * len(row)
+            
+            st.dataframe(
+                df_tabela.style.apply(colorir_linhas, axis=1),
+                use_container_width=True,
+                hide_index=True
+            )
+            
+            st.divider()
+            
+            st.subheader("💰 Registrar Pagamento / Marcar Anuidade")
+            
+            col1, col2, col3, col4 = st.columns(4)
+            
+            with col1:
+                num_anuidade = st.selectbox(
+                    "Selecione a anuidade",
+                    anuidades['numero_anuidade'].tolist(),
+                    key="select_anuidade"
+                )
+            
+            with col2:
+                data_pagamento_input = st.date_input(
+                    "Data do Pagamento",
+                    key="data_pag"
+                )
+            
+            with col3:
+                if st.button("✅ Registrar Pagamento", use_container_width=True):
+                    db.atualizar_status_anuidade(
+                        patente_id,
+                        num_anuidade,
+                        "pago",
+                        data_pagamento_input.strftime("%Y-%m-%d")
+                    )
+                    st.success("✅ Pagamento registrado com sucesso!")
+                    st.rerun()
+            
+            with col4:
+                if st.button("🚫 Marcar Não Pagar", use_container_width=True):
+                    db.atualizar_status_anuidade(
+                        patente_id,
+                        num_anuidade,
+                        "nao_pagar"
+                    )
+                    st.success("✅ Anuidade marcada como não pagar!")
+                    st.rerun()
+        
+        st.divider()
+        
+        if st.button("🗑️ Deletar Patente", use_container_width=True, type="secondary"):
+            if st.checkbox("Tenho certeza que desejo deletar esta patente?"):
+                db.deletar_patente(patente_id)
+                st.success("✅ Patente deletada com sucesso!")
+                st.rerun()
 
-    status_col = colunas_normalizadas.get("status_do_pedido") or colunas_normalizadas.get("status")
-    if status_col:
-        status_unicos = sorted({_normalizar_status(v) for v in df[status_col].dropna().tolist()})
-        problemas.append("Status identificados: " + ", ".join(status_unicos))
+elif pagina == "📤 Importar Excel":
+    st.title("📤 Importar Patentes do Excel")
+    
+    st.info("""
+    📋 O arquivo Excel deve conter as seguintes colunas:
+    - **numero_patente** (obrigatorio)
+    - **data_deposito** (obrigatorio, formato: DD/MM/YYYY ou YYYY-MM-DD)
+    - **data_concessao** (opcional)
+    - **descricao** (opcional)
+    - **titular** (opcional)
+    - **gestor** (opcional) - Se diferente de IFSC, marcar anuidades como não pagar
+    - **status** (opcional) - Se contiver: indeferido, arquivado ou desistência, marcar anuidades como não pagar
+    """)
+    
+    arquivo_excel = st.file_uploader(
+        "Selecione um arquivo Excel (.xlsx)",
+        type="xlsx"
+    )
+    
+    if arquivo_excel:
+        st.subheader("🔎 Conferência da planilha")
+        problemas = db.analisar_inconsistencias_excel(arquivo_excel)
+        for problema in problemas:
+            st.warning(problema)
+        arquivo_excel.seek(0)
 
-    if "campus" not in colunas_normalizadas:
-        problemas.append("A planilha não tem uma coluna chamada Campus; o campo existe no app e ficará vazio até ser preenchido/importado.")
-    if "atributos" not in colunas_normalizadas and "atributo" not in colunas_normalizadas:
-        problemas.append("A planilha não tem uma coluna chamada Atributos; o campo existe no app e ficará vazio até ser preenchido/importado.")
+        if st.button("📥 Importar Dados", use_container_width=True, type="primary"):
+            with st.spinner("Importando dados..."):
+                resultados = db.importar_excel(arquivo_excel)
+            
+            st.subheader("📊 Resultado da Importacao")
+            
+            sucesso_count = sum(1 for _, sucesso, _ in resultados if sucesso)
+            erro_count = len(resultados) - sucesso_count
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                st.metric("✅ Importadas com Sucesso", sucesso_count)
+            with col2:
+                st.metric("❌ Erros", erro_count)
+            
+            dados_resultados = []
+            for patente, sucesso, mensagem in resultados:
+                dados_resultados.append({
+                    "Patente": patente,
+                    "Status": "✅ Sucesso" if sucesso else "❌ Erro",
+                    "Mensagem": mensagem
+                })
+            
+            df_resultados = pd.DataFrame(dados_resultados)
+            st.dataframe(df_resultados, use_container_width=True, hide_index=True)
+            
+            if sucesso_count > 0:
+                st.success(f"🎉 {sucesso_count} patente(s) importada(s) com sucesso!")
+                st.balloons()
 
-    return problemas
+elif pagina == "🤖 Análise IA":
+    st.title("🤖 Análise Inteligente de Patentes")
+    st.markdown("""Utilize a IA para fazer perguntas e análises sobre suas patentes.""")
+    
+    df_patentes = db.obter_patentes()
+    
+    if len(df_patentes) == 0:
+        st.warning("⚠️ Nenhuma patente cadastrada. Primeiro, adicione algumas patentes.")
+    else:
+        st.divider()
+        
+        col1, col2 = st.columns([3, 1])
+        
+        with col1:
+            pergunta = st.text_input(
+                "Faça uma pergunta sobre suas patentes:",
+                placeholder="Ex: Quantas patentes foram concedidas? Quais estão vencidas? Qual é o status das patentes do IFSC?"
+            )
+        
+        with col2:
+            analizar = st.button("🔍 Analisar", use_container_width=True)
+        
+        if analizar and pergunta:
+            with st.spinner("Analisando dados..."):
+                resposta = ai_analyzer.analisar_pergunta(df_patentes, pergunta)
+                st.markdown("### 📋 Resposta:")
+                st.info(resposta)
+        
+        st.divider()
+        
+        st.subheader("📊 Análises Rápidas")
+        
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            if st.button("📈 Estatísticas Gerais", use_container_width=True):
+                stats = ai_analyzer.gerar_estatisticas(df_patentes)
+                st.markdown(stats)
+        
+        with col2:
+            if st.button("🎯 Patentes por Gestor", use_container_width=True):
+                gestores = ai_analyzer.patentes_por_gestor(df_patentes)
+                st.markdown(gestores)
+        
+        with col3:
+            if st.button("⚠️ Alertas Urgentes", use_container_width=True):
+                alertas = ai_analyzer.gerar_alertas(df_patentes)
+                st.markdown(alertas)
+
+elif pagina == "📄 Gerar Relatórios":
+    st.title("📄 Relatórios e Exportação")
+    df_patentes = db.obter_patentes()
+    if len(df_patentes) == 0:
+        st.warning("⚠️ Nenhuma patente cadastrada.")
+    else:
+        st.subheader("📄 Relatórios PDF")
+        c1,c2,c3=st.columns(3)
+        with c1:
+            if st.button("📋 Relatório Completo",use_container_width=True):
+                pdf=report_generator.gerar_relatorio_completo(df_patentes); st.download_button("📥 Baixar PDF Completo",pdf,file_name="relatorio_completo.pdf",mime="application/pdf")
+        with c2:
+            if st.button("📊 Relatório de Anuidades",use_container_width=True):
+                pdf=report_generator.gerar_relatorio_anuidades(df_patentes); st.download_button("📥 Baixar PDF de Anuidades",pdf,file_name="relatorio_anuidades.pdf",mime="application/pdf")
+        with c3:
+            if st.button("⚠️ Relatório de Alertas",use_container_width=True):
+                pdf=report_generator.gerar_relatorio_alertas(df_patentes); st.download_button("📥 Baixar PDF de Alertas",pdf,file_name="relatorio_alertas.pdf",mime="application/pdf")
+        st.divider(); st.subheader("📤 Exportação personalizada por colunas e filtros")
+        tipo=st.radio("Base para exportação",["Patentes","Anuidades"],horizontal=True)
+        busca=st.text_input("🔎 Busca geral",placeholder="Número, título, inventor, titular, gestor, campus...")
+        gestores=sorted([x for x in df_patentes["gestor"].dropna().astype(str).unique() if x]); status_patentes=sorted([x for x in df_patentes["status"].dropna().astype(str).unique() if x]); campi=sorted([x for x in df_patentes["campus"].dropna().astype(str).unique() if x])
+        c1,c2,c3,c4=st.columns(4)
+        with c1: filtro_gestor=st.multiselect("Gestor",gestores)
+        with c2: filtro_status=st.multiselect("Status da Patente",status_patentes)
+        with c3: filtro_campus=st.multiselect("Campus",campi)
+        with c4: filtro_anuidade=st.multiselect("Status da Anuidade",["pendente","pago","nao_pagar"]) if tipo=="Anuidades" else []
+        dados=db.obter_dados_exportacao(tipo,busca,filtro_gestor,filtro_status,filtro_campus,filtro_anuidade)
+        if dados.empty: st.warning("Nenhum registro atende aos filtros.")
+        else:
+            mapa=db.COLUNAS_PATENTES if tipo=="Patentes" else db.COLUNAS_ANUIDADES; opcoes=[c for c in mapa if c in dados.columns]
+            selecionadas=st.multiselect("Selecione as colunas (a ordem escolhida será mantida)",opcoes,default=opcoes,format_func=lambda x:mapa[x])
+            if selecionadas:
+                export_df=db.preparar_exportacao(dados,selecionadas); st.caption(f"{len(export_df)} registro(s) × {len(export_df.columns)} coluna(s)"); st.dataframe(export_df,use_container_width=True,hide_index=True)
+                excel=db.dataframe_para_excel(export_df,tipo); csv=db.dataframe_para_csv(export_df); c1,c2=st.columns(2)
+                with c1: st.download_button("📥 Baixar Excel selecionado",excel,file_name=f"{tipo.lower()}_selecionado.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True)
+                with c2: st.download_button("📥 Baixar CSV selecionado",csv,file_name=f"{tipo.lower()}_selecionado.csv",mime="text/csv",use_container_width=True)
