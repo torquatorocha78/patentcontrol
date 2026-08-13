@@ -1,635 +1,349 @@
-import streamlit as st
+# database.py - SIGPI-IF / banco SQLite relacional
+import sqlite3
+import unicodedata
+from datetime import date
+from pathlib import Path
 import pandas as pd
-from datetime import datetime
-from dateutil.relativedelta import relativedelta
-import database as db
-import utils
-import ai_analyzer
-import report_generator
 
-st.set_page_config(
-    page_title="Gestão de Patentes do IFSC",
-    page_icon="📋",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
-
-db.init_database()
+DB_NAME = 'patentes.db'
 
 
-def data_para_input(valor):
-    if valor is None or pd.isna(valor) or valor == "":
-        return None
+def conectar():
+    conn = sqlite3.connect(DB_NAME, check_same_thread=False)
+    conn.execute('PRAGMA foreign_keys = ON')
+    return conn
+
+
+def _valor_limpo(v):
+    if v is None: return None
     try:
-        return pd.to_datetime(valor).date()
-    except Exception:
+        if pd.isna(v): return None
+    except Exception: pass
+    return v.strip() if isinstance(v, str) and v.strip() else (v if not isinstance(v, str) else None)
+
+
+def _normalizar_coluna(c):
+    s = ''.join(x for x in unicodedata.normalize('NFKD', str(c).strip().lower()) if not unicodedata.combining(x))
+    for x in '/\\-().:;': s = s.replace(x, ' ')
+    return '_'.join(s.split())
+
+
+def _parse_data(v):
+    v = _valor_limpo(v)
+    if v is None: return None
+    try:
+        if not isinstance(v, str) and hasattr(v, 'date'): return v.date().isoformat()
+        s = str(v).strip()
+        if not s: return None
+        if len(s) >= 10 and s[4] == '-' and s[7] == '-': return pd.to_datetime(s).date().isoformat()
+        return pd.to_datetime(s, dayfirst=True).date().isoformat()
+    except Exception: return str(v)
+
+
+def _normalizar_status(v):
+    if not _valor_limpo(v): return 'Ativo'
+    s = str(v).strip(); k = _normalizar_coluna(s)
+    mapa = {'patente_concedida':'Patente Concedida','patente_concedda':'Patente Concedida','concedido':'Patente Concedida','concedida':'Patente Concedida','tramitando_normal':'Tramitando Normal','infederimento':'Indeferimento','indeferimento':'Indeferimento','recurso_contra_indeferimento':'Recurso contra indeferimento','pedido_de_exame':'Pedido de exame','arquivado':'Arquivado','desistencia':'Desistência'}
+    return mapa.get(k, s)
+
+
+def _split(v):
+    if not v: return []
+    s = str(v).replace('\r','\n')
+    for sep in [';','/','|']: s = s.replace(sep,'\n')
+    return list(dict.fromkeys(x.strip() for x in s.split('\n') if x.strip()))
+
+
+def _nao_pagar(gestor, status):
+    g = _normalizar_coluna(gestor or '')
+    if g and g not in ('ifsc','instituto_federal_de_santa_catarina','instituto_federal_sc'):
+        return True
+    s = _normalizar_coluna(status or '')
+    return any(x in s for x in ('indefer','arquiv','desist'))
+
+
+def init_database():
+    conn = conectar(); cur = conn.cursor()
+    # Mantém compatibilidade com a base antiga: as colunas legado titular/inventores
+    # continuam existindo se já estiverem na tabela, mas o relacionamento oficial
+    # passa a ser feito pelas tabelas normalizadas.
+    cur.executescript('''
+    CREATE TABLE IF NOT EXISTS patentes (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      numero_patente TEXT NOT NULL UNIQUE,
+      data_deposito DATE NOT NULL,
+      data_concessao DATE,
+      titulo TEXT, descricao TEXT, gestor TEXT,
+      status TEXT NOT NULL DEFAULT 'Ativo', campus TEXT, atributos TEXT,
+      data_criacao TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      data_atualizacao TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE IF NOT EXISTS inventores (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, nome TEXT NOT NULL UNIQUE,
+      cpf TEXT, email TEXT, instituicao TEXT
+    );
+    CREATE TABLE IF NOT EXISTS patente_inventores (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, patente_id INTEGER NOT NULL,
+      inventor_id INTEGER NOT NULL, ordem INTEGER DEFAULT 1, principal INTEGER DEFAULT 0,
+      FOREIGN KEY(patente_id) REFERENCES patentes(id) ON DELETE CASCADE,
+      FOREIGN KEY(inventor_id) REFERENCES inventores(id) ON DELETE RESTRICT,
+      UNIQUE(patente_id,inventor_id)
+    );
+    CREATE TABLE IF NOT EXISTS titulares (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, nome TEXT NOT NULL UNIQUE,
+      documento TEXT, tipo TEXT, email TEXT
+    );
+    CREATE TABLE IF NOT EXISTS patente_titulares (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, patente_id INTEGER NOT NULL,
+      titular_id INTEGER NOT NULL, percentual REAL, principal INTEGER DEFAULT 0,
+      ordem INTEGER DEFAULT 1,
+      FOREIGN KEY(patente_id) REFERENCES patentes(id) ON DELETE CASCADE,
+      FOREIGN KEY(titular_id) REFERENCES titulares(id) ON DELETE RESTRICT,
+      UNIQUE(patente_id,titular_id)
+    );
+    CREATE TABLE IF NOT EXISTS anuidades (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, patente_id INTEGER NOT NULL,
+      numero_anuidade INTEGER NOT NULL, data_inicio_ordinario DATE,
+      data_fim_ordinario DATE, data_inicio_extraordinario DATE,
+      data_fim_extraordinario DATE, status TEXT DEFAULT 'pendente',
+      data_pagamento DATE, observacao TEXT,
+      FOREIGN KEY(patente_id) REFERENCES patentes(id) ON DELETE CASCADE,
+      UNIQUE(patente_id,numero_anuidade)
+    );
+    CREATE TABLE IF NOT EXISTS documentos (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, patente_id INTEGER NOT NULL,
+      tipo TEXT, nome_arquivo TEXT NOT NULL, caminho TEXT, descricao TEXT,
+      data_documento DATE, data_upload TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY(patente_id) REFERENCES patentes(id) ON DELETE CASCADE
+    );
+    CREATE TABLE IF NOT EXISTS historico (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, patente_id INTEGER NOT NULL,
+      data_evento TIMESTAMP DEFAULT CURRENT_TIMESTAMP, tipo_evento TEXT NOT NULL,
+      descricao TEXT, usuario TEXT,
+      FOREIGN KEY(patente_id) REFERENCES patentes(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_patentes_status ON patentes(status);
+    CREATE INDEX IF NOT EXISTS idx_patentes_gestor ON patentes(gestor);
+    CREATE INDEX IF NOT EXISTS idx_anuidades_status ON anuidades(status);
+    CREATE INDEX IF NOT EXISTS idx_anuidades_patente ON anuidades(patente_id);
+    CREATE INDEX IF NOT EXISTS idx_historico_patente ON historico(patente_id);
+    ''')
+    cols = {r[1] for r in cur.execute('PRAGMA table_info(patentes)')}
+    for col in ('titulo','campus','atributos','data_criacao','data_atualizacao'):
+        if col not in cols:
+            typ = 'TIMESTAMP' if col.startswith('data_') else 'TEXT'
+            cur.execute(f'ALTER TABLE patentes ADD COLUMN {col} {typ}')
+    # migração de colunas legadas, se existirem
+    cols = {r[1] for r in cur.execute('PRAGMA table_info(patentes)')}
+    for col in ('titular','inventores'):
+        if col not in cols: cur.execute(f'ALTER TABLE patentes ADD COLUMN {col} TEXT')
+    conn.commit(); _migrar_legado(conn); conn.close(); garantir_anuidades_existentes()
+
+
+def _migrar_legado(conn):
+    cur=conn.cursor()
+    rows=cur.execute('SELECT id,titular,inventores,gestor,status FROM patentes').fetchall()
+    for pid,tit,invs,gest,status in rows:
+        for ordem,nome in enumerate(_split(tit),1):
+            cur.execute('INSERT OR IGNORE INTO titulares(nome) VALUES(?)',(nome,))
+            tid=cur.execute('SELECT id FROM titulares WHERE nome=?',(nome,)).fetchone()[0]
+            cur.execute('INSERT OR IGNORE INTO patente_titulares(patente_id,titular_id,ordem,principal) VALUES(?,?,?,?)',(pid,tid,ordem,1 if ordem==1 else 0))
+        for ordem,nome in enumerate(_split(invs),1):
+            cur.execute('INSERT OR IGNORE INTO inventores(nome) VALUES(?)',(nome,))
+            iid=cur.execute('SELECT id FROM inventores WHERE nome=?',(nome,)).fetchone()[0]
+            cur.execute('INSERT OR IGNORE INTO patente_inventores(patente_id,inventor_id,ordem,principal) VALUES(?,?,?,?)',(pid,iid,ordem,1 if ordem==1 else 0))
+        if _nao_pagar(gest,status): cur.execute("UPDATE anuidades SET status='nao_pagar' WHERE patente_id=? AND status<>'pago'",(pid,))
+    conn.commit()
+
+
+def obter_patentes():
+    conn=conectar()
+    q="""SELECT p.id,p.numero_patente,p.data_deposito,p.data_concessao,p.titulo,p.descricao,p.gestor,p.status,p.campus,p.atributos,p.data_criacao,p.data_atualizacao, COALESCE((SELECT GROUP_CONCAT(i.nome,' / ') FROM patente_inventores pi JOIN inventores i ON i.id=pi.inventor_id WHERE pi.patente_id=p.id ORDER BY pi.ordem),'') AS inventores, COALESCE((SELECT GROUP_CONCAT(t.nome,' / ') FROM patente_titulares pt JOIN titulares t ON t.id=pt.titular_id WHERE pt.patente_id=p.id ORDER BY pt.principal DESC,pt.ordem),'') AS titular FROM patentes p ORDER BY p.id"""
+    df=pd.read_sql_query(q,conn); conn.close(); return df
+
+
+def obter_anuidades(patente_id):
+    conn=conectar(); cur=conn.cursor(); r=cur.execute('SELECT data_deposito,gestor,status FROM patentes WHERE id=?',(int(patente_id),)).fetchone()
+    if r:
+        _garantir_anuidades_patente(cur,int(patente_id),r[0])
+        if _nao_pagar(r[1],r[2]): cur.execute("UPDATE anuidades SET status='nao_pagar' WHERE patente_id=? AND status NOT IN('pago','nao_pagar')",(int(patente_id),))
+        conn.commit()
+    df=pd.read_sql_query('SELECT * FROM anuidades WHERE patente_id=? ORDER BY numero_anuidade',conn,params=(int(patente_id),)); conn.close(); return df
+
+
+def _datas_anuidade(dep,n):
+    inicio=pd.to_datetime(dep); ini=inicio+pd.DateOffset(years=n-1); fim=ini+pd.DateOffset(months=3); ext=fim; fimext=ext+pd.DateOffset(months=6)
+    return ini.date(),fim.date(),ext.date(),fimext.date()
+
+
+def _garantir_anuidades_patente(cur,pid,dep):
+    if not dep:return
+    existentes={r[0] for r in cur.execute('SELECT numero_anuidade FROM anuidades WHERE patente_id=?',(pid,))}
+    for n in range(1,21):
+        if n in existentes:continue
+        a,b,c,d=_datas_anuidade(dep,n)
+        cur.execute('INSERT INTO anuidades(patente_id,numero_anuidade,data_inicio_ordinario,data_fim_ordinario,data_inicio_extraordinario,data_fim_extraordinario,status) VALUES(?,?,?,?,?,?,?)',(pid,n,a,b,c,d,'pendente'))
+
+
+def garantir_anuidades_existentes():
+    conn=conectar();cur=conn.cursor()
+    for pid,dep,g,s in cur.execute('SELECT id,data_deposito,gestor,status FROM patentes'):
+        _garantir_anuidades_patente(cur,pid,dep)
+        if _nao_pagar(g,s):cur.execute("UPDATE anuidades SET status='nao_pagar' WHERE patente_id=? AND status NOT IN('pago','nao_pagar')",(pid,))
+    conn.commit();conn.close()
+
+
+def _sync_people(cur,pid,titular,inventores):
+    cur.execute('DELETE FROM patente_inventores WHERE patente_id=?',(pid,));cur.execute('DELETE FROM patente_titulares WHERE patente_id=?',(pid,))
+    for ordem,nome in enumerate(_split(inventores),1):
+        cur.execute('INSERT OR IGNORE INTO inventores(nome) VALUES(?)',(nome,)); iid=cur.execute('SELECT id FROM inventores WHERE nome=?',(nome,)).fetchone()[0]
+        cur.execute('INSERT INTO patente_inventores(patente_id,inventor_id,ordem,principal) VALUES(?,?,?,?)',(pid,iid,ordem,1 if ordem==1 else 0))
+    for ordem,nome in enumerate(_split(titular),1):
+        cur.execute('INSERT OR IGNORE INTO titulares(nome) VALUES(?)',(nome,)); tid=cur.execute('SELECT id FROM titulares WHERE nome=?',(nome,)).fetchone()[0]
+        cur.execute('INSERT INTO patente_titulares(patente_id,titular_id,ordem,principal) VALUES(?,?,?,?)',(pid,tid,ordem,1 if ordem==1 else 0))
+
+
+def adicionar_patente(numero,data_dep,data_conc,descricao,titular,gestor=None,status_patente='Ativo',titulo=None,inventores=None,campus=None,atributos=None):
+    conn=conectar();cur=conn.cursor()
+    try:
+        status_patente=_normalizar_status(status_patente); dep=_parse_data(data_dep); conc=_parse_data(data_conc)
+        cur.execute('INSERT INTO patentes(numero_patente,data_deposito,data_concessao,titulo,descricao,gestor,status,campus,atributos) VALUES(?,?,?,?,?,?,?,?,?)',(str(numero).strip(),dep,conc,_valor_limpo(titulo),_valor_limpo(descricao),_valor_limpo(gestor),status_patente,_valor_limpo(campus),_valor_limpo(atributos)))
+        pid=cur.lastrowid;_sync_people(cur,pid,titular,inventores);_garantir_anuidades_patente(cur,pid,dep)
+        if _nao_pagar(gestor,status_patente):cur.execute("UPDATE anuidades SET status='nao_pagar' WHERE patente_id=?",(pid,))
+        cur.execute("INSERT INTO historico(patente_id,tipo_evento,descricao) VALUES(?,?,?)",(pid,'CADASTRO','Patente cadastrada no SIGPI-IF'))
+        conn.commit();return True,'Patente cadastrada com sucesso.'
+    except Exception as e:conn.rollback();return False,str(e)
+    finally:conn.close()
+
+
+def atualizar_patente(patente_id,numero,data_dep,data_conc,descricao,titular,gestor=None,status_patente='Ativo',titulo=None,inventores=None,campus=None,atributos=None):
+    conn=conectar();cur=conn.cursor()
+    try:
+        status_patente=_normalizar_status(status_patente);dep=_parse_data(data_dep);conc=_parse_data(data_conc)
+        cur.execute('UPDATE patentes SET numero_patente=?,data_deposito=?,data_concessao=?,titulo=?,descricao=?,gestor=?,status=?,campus=?,atributos=?,data_atualizacao=CURRENT_TIMESTAMP WHERE id=?',(numero,dep,conc,_valor_limpo(titulo),_valor_limpo(descricao),_valor_limpo(gestor),status_patente,_valor_limpo(campus),_valor_limpo(atributos),int(patente_id)))
+        _sync_people(cur,int(patente_id),titular,inventores);_garantir_anuidades_patente(cur,int(patente_id),dep)
+        if _nao_pagar(gestor,status_patente):cur.execute("UPDATE anuidades SET status='nao_pagar' WHERE patente_id=? AND status NOT IN('pago','nao_pagar')",(int(patente_id),))
+        cur.execute("INSERT INTO historico(patente_id,tipo_evento,descricao) VALUES(?,?,?)",(int(patente_id),'ATUALIZACAO','Dados da patente atualizados'))
+        conn.commit();return True,'Patente atualizada com sucesso.'
+    except Exception as e:conn.rollback();return False,str(e)
+    finally:conn.close()
+
+
+def salvar_patente_importada(dados):
+    conn=conectar();r=conn.execute('SELECT id FROM patentes WHERE numero_patente=?',(dados['numero'],)).fetchone();conn.close()
+    if r:
+        ok,msg=atualizar_patente(r[0],**dados);return ok,('Atualizada: '+msg if ok else msg)
+    ok,msg=adicionar_patente(**dados);return ok,('Importada: '+msg if ok else msg)
+
+
+def atualizar_status_anuidade(patente_id,numero_anuidade,novo_status,data_pagamento=None):
+    conn=conectar();
+    try:
+        if novo_status=='pago': conn.execute("UPDATE anuidades SET status='pago',data_pagamento=? WHERE patente_id=? AND numero_anuidade=?",(_parse_data(data_pagamento),patente_id,numero_anuidade))
+        elif novo_status=='nao_pagar': conn.execute("UPDATE anuidades SET status='nao_pagar',data_pagamento=NULL WHERE patente_id=? AND numero_anuidade=?",(patente_id,numero_anuidade))
+        else: conn.execute("UPDATE anuidades SET status='pendente',data_pagamento=NULL WHERE patente_id=? AND numero_anuidade=?",(patente_id,numero_anuidade))
+        conn.execute("INSERT INTO historico(patente_id,tipo_evento,descricao) VALUES(?,?,?)",(patente_id,'ANUIDADE',f'Anuidade {numero_anuidade}: {novo_status}'));conn.commit()
+    finally:conn.close()
+
+
+def deletar_patente(patente_id):
+    conn=conectar();conn.execute('DELETE FROM patentes WHERE id=?',(int(patente_id),));conn.commit();conn.close()
+
+
+def registrar_historico(patente_id,tipo_evento,descricao,usuario=None):
+    conn=conectar();conn.execute('INSERT INTO historico(patente_id,tipo_evento,descricao,usuario) VALUES(?,?,?,?)',(patente_id,tipo_evento,descricao,usuario));conn.commit();conn.close()
+
+
+def obter_dataset_anuidades():
+    conn=conectar();q='''SELECT p.id patente_id,p.numero_patente,p.titulo,p.data_deposito,p.data_concessao,p.gestor,p.status status_patente,p.campus,a.numero_anuidade,a.data_inicio_ordinario,a.data_fim_ordinario,a.data_inicio_extraordinario,a.data_fim_extraordinario,a.status status_anuidade,a.data_pagamento,a.observacao,COALESCE((SELECT GROUP_CONCAT(i.nome,' / ') FROM patente_inventores pi JOIN inventores i ON i.id=pi.inventor_id WHERE pi.patente_id=p.id),'') inventores,COALESCE((SELECT GROUP_CONCAT(t.nome,' / ') FROM patente_titulares pt JOIN titulares t ON t.id=pt.titular_id WHERE pt.patente_id=p.id),'') titular FROM patentes p JOIN anuidades a ON a.patente_id=p.id ORDER BY p.numero_patente,a.numero_anuidade''';df=pd.read_sql_query(q,conn);conn.close();return df
+
+
+def obter_inventores(patente_id=None):
+    conn=conectar();q='SELECT i.*,pi.ordem,pi.principal FROM inventores i JOIN patente_inventores pi ON pi.inventor_id=i.id WHERE pi.patente_id=? ORDER BY pi.ordem';df=pd.read_sql_query(q,conn,params=(patente_id,)) if patente_id else pd.read_sql_query('SELECT * FROM inventores ORDER BY nome',conn);conn.close();return df
+
+def obter_titulares(patente_id=None):
+    conn=conectar();q='SELECT t.*,pt.ordem,pt.principal,pt.percentual FROM titulares t JOIN patente_titulares pt ON pt.titular_id=t.id WHERE pt.patente_id=? ORDER BY pt.ordem';df=pd.read_sql_query(q,conn,params=(patente_id,)) if patente_id else pd.read_sql_query('SELECT * FROM titulares ORDER BY nome',conn);conn.close();return df
+
+def obter_documentos(patente_id):
+    conn=conectar();df=pd.read_sql_query('SELECT * FROM documentos WHERE patente_id=? ORDER BY id DESC',conn,params=(patente_id,));conn.close();return df
+
+def obter_historico(patente_id):
+    conn=conectar();df=pd.read_sql_query('SELECT * FROM historico WHERE patente_id=? ORDER BY data_evento DESC,id DESC',conn,params=(patente_id,));conn.close();return df
+
+
+def _map_excel(df):
+    cols={_normalizar_coluna(c):c for c in df.columns}
+    def f(*names):
+        for n in names:
+            if _normalizar_coluna(n) in cols:return cols[_normalizar_coluna(n)]
         return None
+    return {'numero':f('numero_patente','número patente','numero patente','patente'),'data_dep':f('data_deposito','data depósito','data deposito'),'data_conc':f('data_concessao','data concessão','data concessao'),'titulo':f('titulo','título'),'descricao':f('resumo','descricao','descrição'),'inventores':f('nome dos inventores','inventores','nome_dos_inventores'),'titular':f('depositante titular','depositante/ titular','titular','depositante'),'gestor':f('gestor'),'status':f('status do pedido','status','situacao','situação'),'campus':f('campus'),'atributos':f('atributos','atributo')}
 
 
-def texto(valor):
-    if valor is None or pd.isna(valor):
-        return ""
-    return str(valor)
+def importar_excel(arquivo_excel):
+    res=[]
+    try:
+        df=pd.read_excel(arquivo_excel);m=_map_excel(df)
+        for _,r in df.iterrows():
+            n=_valor_limpo(r.get(m['numero'])) if m['numero'] else None;dep=_parse_data(r.get(m['data_dep'])) if m['data_dep'] else None
+            if not n or not dep:res.append((n or 'SEM_NUMERO',False,'Número da patente ou data de depósito ausente'));continue
+            d={'numero':str(n),'data_dep':dep,'data_conc':_parse_data(r.get(m['data_conc'])) if m['data_conc'] else None,'descricao':_valor_limpo(r.get(m['descricao'])) if m['descricao'] else None,'titular':_valor_limpo(r.get(m['titular'])) if m['titular'] else None,'gestor':_valor_limpo(r.get(m['gestor'])) if m['gestor'] else None,'status_patente':_normalizar_status(r.get(m['status'])) if m['status'] else 'Ativo','titulo':_valor_limpo(r.get(m['titulo'])) if m['titulo'] else None,'inventores':_valor_limpo(r.get(m['inventores'])) if m['inventores'] else None,'campus':_valor_limpo(r.get(m['campus'])) if m['campus'] else None,'atributos':_valor_limpo(r.get(m['atributos'])) if m['atributos'] else None}
+            ok,msg=salvar_patente_importada(d);res.append((n,ok,msg))
+    except Exception as e:res.append(('ERRO_GERAL',False,str(e)))
+    return res
 
-st.markdown("""
-<style>
-    .status-verde { color: #00CC00; font-weight: bold; }
-    .status-amarelo { color: #FFCC00; font-weight: bold; }
-    .status-vermelho { color: #FF0000; font-weight: bold; }
-    .status-pago { color: #0099FF; font-weight: bold; }
-    .title-ifsc { text-align: center; color: #003366; }
-</style>
-""", unsafe_allow_html=True)
 
-# Logo e Título Principal
-st.markdown('<h1 class="title-ifsc">🏛️ Gestão de Patentes do IFSC</h1>', unsafe_allow_html=True)
-st.markdown('<p style="text-align: center; color: #666;">Instituto Federal de Educação, Ciência e Tecnologia de Santa Catarina</p>', unsafe_allow_html=True)
-st.divider()
+def analisar_inconsistencias_excel(arquivo_excel):
+    df=pd.read_excel(arquivo_excel);cols={_normalizar_coluna(c):c for c in df.columns};p=[]
+    for x in ('numero_patente','data_deposito'):
+        if _normalizar_coluna(x) not in cols:p.append(f'Coluna obrigatória não encontrada: {x}')
+    if 'numero_patente' in cols:
+        c=cols['numero_patente'];v=int(df[c].isna().sum());dups=df[df[c].duplicated(keep=False)][c].dropna().unique()
+        if v:p.append(f'{v} linha(s) sem número de patente.')
+        if len(dups):p.append('Números de patente duplicados: '+', '.join(map(str,dups)))
+    return p
 
-st.sidebar.title("⚙️ Navegação")
-pagina = st.sidebar.radio("Selecione uma página:", 
-    ["📊 Dashboard", "➕ Adicionar Patente", "📁 Minhas Patentes", "📤 Importar Excel", "🤖 Análise IA", "📄 Gerar Relatórios"])
+COLUNAS_PATENTES={'id':'ID','numero_patente':'Número da Patente','titulo':'Título','data_deposito':'Data de Depósito','data_concessao':'Data de Concessão','status':'Status','gestor':'Gestor','campus':'Campus','titular':'Titular','inventores':'Inventores','descricao':'Descrição','atributos':'Atributos'}
+COLUNAS_ANUIDADES={'patente_id':'ID Patente','numero_patente':'Número da Patente','titulo':'Título','data_deposito':'Data de Depósito','data_concessao':'Data de Concessão','gestor':'Gestor','campus':'Campus','status_patente':'Status da Patente','numero_anuidade':'Anuidade','data_inicio_ordinario':'Início Ordinário','data_fim_ordinario':'Fim Ordinário','data_inicio_extraordinario':'Início Extraordinário','data_fim_extraordinario':'Fim Extraordinário','status_anuidade':'Status da Anuidade','data_pagamento':'Data de Pagamento','titular':'Titular','inventores':'Inventores','observacao':'Observação'}
 
-if pagina == "📊 Dashboard":
-    st.title("📊 Dashboard de Patentes")
-    
-    df_patentes = db.obter_patentes()
-    
-    if len(df_patentes) == 0:
-        st.info("📭 Nenhuma patente cadastrada ainda. Adicione uma patente para começar!")
-    else:
-        total_patentes = len(df_patentes)
 
-        hoje = datetime.now().date()
+def obter_dados_exportacao(tipo='Patentes',busca='',gestores=None,status_patentes=None,campi=None,status_anuidades=None):
+    df=obter_patentes() if tipo=='Patentes' else obter_dataset_anuidades();gestores=gestores or [];status_patentes=status_patentes or [];campi=campi or [];status_anuidades=status_anuidades or []
+    if busca:
+        mask=pd.Series(False,index=df.index);t=str(busca).lower().strip()
+        for c in df.columns:
+            mask |= df[c].fillna('').astype(str).str.lower().str.contains(t,regex=False)
+        df=df[mask]
+    if gestores and 'gestor' in df:df=df[df.gestor.fillna('').isin(gestores)]
+    if status_patentes:
+        c='status_patente' if 'status_patente' in df else 'status';df=df[df[c].fillna('').isin(status_patentes)]
+    if campi and 'campus' in df:df=df[df.campus.fillna('').isin(campi)]
+    if status_anuidades and 'status_anuidade' in df:df=df[df.status_anuidade.fillna('').isin(status_anuidades)]
+    return df.reset_index(drop=True)
 
-        def data_anuidade(valor):
-            try:
-                return pd.to_datetime(valor).date()
-            except Exception:
-                return None
 
-        def dados_prazo_ordinario(anu):
-            if anu['status'] == 'nao_pagar' or anu['data_pagamento']:
-                return None
+def preparar_exportacao(df,colunas):
+    out=df[[c for c in colunas if c in df.columns]].copy()
+    for c in out.columns:
+        if 'data_' in c:
+            out[c]=pd.to_datetime(out[c],errors='coerce').dt.strftime('%d/%m/%Y').fillna('')
+    mapa={**COLUNAS_PATENTES,**COLUNAS_ANUIDADES};return out.rename(columns={c:mapa.get(c,c) for c in out.columns})
 
-            inicio_ord = data_anuidade(anu['data_inicio_ordinario'])
-            fim_ord = data_anuidade(anu['data_fim_ordinario'])
-            if not inicio_ord or not fim_ord or not (inicio_ord <= hoje <= fim_ord):
-                return None
 
-            dias_restantes = (fim_ord - hoje).days
-            status = 'amarelo' if dias_restantes <= 30 else 'verde'
-            return status, dias_restantes
+def dataframe_para_excel(df,nome_aba='Patentes'):
+    from io import BytesIO
+    b=BytesIO()
+    with pd.ExcelWriter(b,engine='openpyxl') as w:
+        df.to_excel(w,index=False,sheet_name=nome_aba[:31]);ws=w.book[nome_aba[:31]];ws.freeze_panes='A2';ws.auto_filter.ref=ws.dimensions
+        for col in ws.columns:
+            ws.column_dimensions[col[0].column_letter].width=min(max(len(str(x.value or '')) for x in col)+2,60)
+    b.seek(0);return b
 
-        dados_dashboard = []
 
-        for _, patente in df_patentes.iterrows():
-            anuidades = db.obter_anuidades(patente['id'])
-            for _, anu in anuidades.iterrows():
-                prazo = dados_prazo_ordinario(anu)
-                if not prazo:
-                    continue
+def dataframe_para_csv(df):
+    from io import BytesIO
+    return BytesIO(df.to_csv(index=False,sep=';',encoding='utf-8-sig').encode('utf-8-sig'))
 
-                status, dias_restantes = prazo
-                emoji = utils.criar_emoji_status(status)
-                dados_dashboard.append({
-                    "ID": patente['id'],
-                    "Patente": patente['numero_patente'],
-                    "Título": patente.get('titulo') or "-",
-                    "Deposito": utils.formatar_data(patente['data_deposito']),
-                    "Status": f"{emoji} {status.upper()}",
-                    "Anuidade": anu['numero_anuidade'],
-                    "Fim Prazo Ordinário": utils.formatar_data(anu['data_fim_ordinario']),
-                    "Dias p/ Vencer": dias_restantes,
-                    "Gestor": patente.get('gestor', 'N/A'),
-                    "Campus": patente.get('campus') or "-"
-                })
 
-        alertas_verde = sum(1 for item in dados_dashboard if '✅' in item["Status"])
-        alertas_amarelo = sum(1 for item in dados_dashboard if '⚠️' in item["Status"])
-
-        col1, col2, col3, col4 = st.columns(4)
-        
-        with col1:
-            st.metric("📚 Total de Patentes", total_patentes)
-        
-        with col2:
-            st.metric("📅 Em Prazo Ordinário", len(dados_dashboard))
-        
-        with col3:
-            st.metric("✅ Normal", alertas_verde, delta="green")
-        
-        with col4:
-            st.metric("⚠️ Atenção", alertas_amarelo, delta="orange")
-        
-        st.divider()
-        
-        st.subheader("Anuidades em Prazo Ordinário")
-        
-        df_dashboard = pd.DataFrame(dados_dashboard)
-        
-        def colorir_status(row):
-            if '⚠️' in str(row['Status']):
-                return ['background-color: #ffffcc'] * len(row)
-            elif '✅' in str(row['Status']):
-                return ['background-color: #ccffcc'] * len(row)
-            else:
-                return [''] * len(row)
-
-        if df_dashboard.empty:
-            st.info("Nenhuma anuidade está em prazo ordinário neste momento.")
-        else:
-            df_dashboard = df_dashboard.sort_values("Dias p/ Vencer")
-            st.dataframe(
-                df_dashboard.style.apply(colorir_status, axis=1),
-                use_container_width=True,
-                hide_index=True
-            )
-
-elif pagina == "➕ Adicionar Patente":
-    st.title("➕ Adicionar Nova Patente")
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        numero_patente = st.text_input(
-            "Numero da Patente",
-            placeholder="Ex: BR1020220000001",
-            help="Identificador unico da patente"
-        )
-
-        titulo = st.text_input(
-            "Título",
-            placeholder="Título da patente"
-        )
-        
-        data_deposito = st.date_input(
-            "Data do Deposito",
-            help="Data em que a patente foi depositada no INPI"
-        )
-        
-        gestor = st.text_input(
-            "Gestor (opcional)",
-            placeholder="Ex: IFSC, Empresa XYZ",
-            help="Responsável pela gestão da patente"
-        )
-    
-    with col2:
-        data_concessao = st.date_input(
-            "Data de Concessao (opcional)",
-            value=None,
-            help="Data em que a patente foi concedida"
-        )
-        
-        titular = st.text_input(
-            "Titular/Proprietario (opcional)",
-            placeholder="Ex: Empresa XYZ"
-        )
-
-        inventores = st.text_area(
-            "Nome dos Inventores (opcional)",
-            placeholder="Separe os nomes por / ou por linha",
-            height=90
-        )
-        
-        status_patente = st.selectbox(
-            "Status (opcional)",
-            ["Ativo", "Patente Concedida", "Tramitando Normal", "Indeferimento", "Recurso contra indeferimento", "Pedido de exame", "Arquivado", "Desistência"],
-            help="Status atual da patente"
-        )
-
-        campus = st.text_input(
-            "Campus (opcional)",
-            placeholder="Ex: Florianópolis, Joinville"
-        )
-    
-    descricao = st.text_area(
-        "Resumo/Descricao (opcional)",
-        placeholder="Descreva brevemente o objeto da patente",
-        height=100
-    )
-
-    atributos = st.text_area(
-        "Atributos (opcional)",
-        placeholder="Informações complementares ou classificações",
-        height=80
-    )
-    
-    st.divider()
-    
-    if st.button("✅ Adicionar Patente", use_container_width=True, type="primary"):
-        if not numero_patente or not data_deposito:
-            st.error("❌ Por favor, preencha pelo menos o Numero da Patente e a Data do Deposito.")
-        else:
-            data_dep_str = data_deposito.strftime("%Y-%m-%d")
-            data_conc_str = data_concessao.strftime("%Y-%m-%d") if data_concessao else None
-            
-            sucesso, mensagem = db.adicionar_patente(
-                numero_patente,
-                data_dep_str,
-                data_conc_str,
-                descricao,
-                titular,
-                gestor,
-                status_patente,
-                titulo,
-                inventores,
-                campus,
-                atributos
-            )
-            
-            if sucesso:
-                st.success(f"✅ {mensagem}")
-                st.balloons()
-                
-                st.subheader("📅 Anuidades Calculadas")
-                
-                df_patentes = db.obter_patentes()
-                patente_id = df_patentes[df_patentes['numero_patente'] == numero_patente]['id'].values[0]
-                anuidades = db.obter_anuidades(patente_id)
-                
-                dados_anuidades = []
-                for _, anu in anuidades.iterrows():
-                    dados_anuidades.append({
-                        "Anuidade": anu['numero_anuidade'],
-                        "Inicio Ordinario": utils.formatar_data(anu['data_inicio_ordinario']),
-                        "Fim Ordinario": utils.formatar_data(anu['data_fim_ordinario']),
-                        "Inicio Extraordinario": utils.formatar_data(anu['data_inicio_extraordinario']),
-                        "Fim Extraordinario": utils.formatar_data(anu['data_fim_extraordinario'])
-                    })
-                
-                df_anuidades = pd.DataFrame(dados_anuidades)
-                st.dataframe(df_anuidades, use_container_width=True, hide_index=True)
-            else:
-                st.error(f"❌ {mensagem}")
-
-elif pagina == "📁 Minhas Patentes":
-    st.title("📁 Minhas Patentes")
-    
-    df_patentes = db.obter_patentes()
-    
-    if len(df_patentes) == 0:
-        st.info("📭 Nenhuma patente cadastrada. Va em 'Adicionar Patente' para começar.")
-    else:
-        busca = st.text_input("Buscar por número, título, inventor, gestor ou campus:")
-        df_filtrado = df_patentes.copy()
-        if busca:
-            termo = busca.lower()
-            colunas_busca = ["numero_patente", "titulo", "inventores", "gestor", "campus"]
-            mascara = pd.Series(False, index=df_filtrado.index)
-            for coluna in colunas_busca:
-                if coluna in df_filtrado:
-                    mascara = mascara | df_filtrado[coluna].fillna("").astype(str).str.lower().str.contains(termo, regex=False)
-            df_filtrado = df_filtrado[mascara]
-
-        if len(df_filtrado) == 0:
-            st.warning("Nenhuma patente encontrada com esse filtro.")
-            st.stop()
-
-        opcoes = {
-            f"{row['numero_patente']} - {row.get('titulo') or 'Sem título'}": row['numero_patente']
-            for _, row in df_filtrado.iterrows()
-        }
-        patente_label = st.selectbox("Selecione uma patente:", list(opcoes.keys()))
-        patente_selecionada = opcoes[patente_label]
-        
-        patente_dados = df_patentes[df_patentes['numero_patente'] == patente_selecionada].iloc[0]
-        patente_id = patente_dados['id']
-        
-        col1, col2, col3, col4 = st.columns(4)
-        with col1:
-            st.metric("📝 Numero", patente_selecionada)
-        with col2:
-            st.metric("📅 Deposito", utils.formatar_data(patente_dados['data_deposito']))
-        with col3:
-            st.metric("✅ Concessao", utils.formatar_data(patente_dados['data_concessao']) if patente_dados['data_concessao'] else "Pendente")
-        with col4:
-            st.metric("👤 Titular", patente_dados['titular'] if patente_dados['titular'] else "N/A")
-        
-        col1, col2 = st.columns(2)
-        with col1:
-            st.metric("🔑 Gestor", patente_dados.get('gestor', 'N/A'))
-        with col2:
-            st.metric("📊 Status", patente_dados.get('status', 'Ativo'))
-
-        col1, col2 = st.columns(2)
-        with col1:
-            st.metric("🏫 Campus", patente_dados.get('campus') if patente_dados.get('campus') else "N/A")
-        with col2:
-            st.metric("📌 Título", patente_dados.get('titulo') if patente_dados.get('titulo') else "Sem título")
-
-        if patente_dados.get('inventores'):
-            st.info(f"**Inventores:** {patente_dados['inventores']}")
-
-        if patente_dados.get('atributos'):
-            st.info(f"**Atributos:** {patente_dados['atributos']}")
-        
-        if patente_dados['descricao']:
-            st.info(f"**Resumo/Descricao:** {patente_dados['descricao']}")
-
-        st.divider()
-
-        with st.expander("✏️ Editar dados da patente"):
-            with st.form(f"form_editar_{patente_id}"):
-                col1, col2 = st.columns(2)
-
-                with col1:
-                    edit_numero = st.text_input("Número da Patente", value=texto(patente_dados.get('numero_patente')))
-                    edit_titulo = st.text_input("Título", value=texto(patente_dados.get('titulo')))
-                    edit_data_dep = st.date_input(
-                        "Data do Depósito",
-                        value=data_para_input(patente_dados.get('data_deposito'))
-                    )
-                    edit_data_conc = st.date_input(
-                        "Data de Concessão",
-                        value=data_para_input(patente_dados.get('data_concessao'))
-                    )
-                    edit_gestor = st.text_input("Gestor", value=texto(patente_dados.get('gestor')))
-                    edit_campus = st.text_input("Campus", value=texto(patente_dados.get('campus')))
-
-                with col2:
-                    edit_titular = st.text_area("Depositante/Titular", value=texto(patente_dados.get('titular')), height=90)
-                    edit_inventores = st.text_area("Nome dos Inventores", value=texto(patente_dados.get('inventores')), height=90)
-                    edit_status = st.text_input("Status do Pedido", value=texto(patente_dados.get('status')))
-                    edit_atributos = st.text_area("Atributos", value=texto(patente_dados.get('atributos')), height=90)
-
-                edit_descricao = st.text_area("Resumo/Descrição", value=texto(patente_dados.get('descricao')), height=130)
-
-                salvar = st.form_submit_button("💾 Salvar alterações", use_container_width=True, type="primary")
-
-                if salvar:
-                    if not edit_numero or not edit_data_dep:
-                        st.error("Preencha pelo menos o número da patente e a data do depósito.")
-                    else:
-                        ok, msg = db.atualizar_patente(
-                            patente_id,
-                            edit_numero,
-                            edit_data_dep.strftime("%Y-%m-%d") if edit_data_dep else None,
-                            edit_data_conc.strftime("%Y-%m-%d") if edit_data_conc else None,
-                            edit_descricao,
-                            edit_titular,
-                            edit_gestor,
-                            edit_status,
-                            edit_titulo,
-                            edit_inventores,
-                            edit_campus,
-                            edit_atributos
-                        )
-                        if ok:
-                            st.success(msg)
-                            st.rerun()
-                        else:
-                            st.error(msg)
-        
-        st.divider()
-        
-        st.subheader("📊 Detalhamento de Anuidades")
-        
-        anuidades = db.obter_anuidades(patente_id)
-        
-        if anuidades.empty:
-            st.warning("Nenhuma anuidade encontrada para esta patente. Verifique a data de depósito cadastrada.")
-        else:
-            dados_tabela = []
-            for _, anu in anuidades.iterrows():
-                if anu['status'] == 'nao_pagar':
-                    emoji = '⛔'
-                    status_display = 'NÃO PAGAR'
-                    dias_restantes = '-'
-                else:
-                    status = utils.calcular_status_anuidade(
-                        anu['data_inicio_ordinario'],
-                        anu['data_fim_ordinario'],
-                        anu['data_inicio_extraordinario'],
-                        anu['data_fim_extraordinario'],
-                        anu['data_pagamento']
-                    )
-                    
-                    dias_restantes = utils.obter_dias_restantes(
-                        anu['data_fim_ordinario'],
-                        anu['data_pagamento']
-                    )
-                    
-                    emoji = utils.criar_emoji_status(status)
-                    status_display = status.upper()
-                
-                dados_tabela.append({
-                    "Anuidade": anu['numero_anuidade'],
-                    "Inicio Ordinario": utils.formatar_data(anu['data_inicio_ordinario']),
-                    "Fim Ordinario": utils.formatar_data(anu['data_fim_ordinario']),
-                    "Dias Restantes": dias_restantes if dias_restantes != '-' else ("Pago" if anu['data_pagamento'] else '-'),
-                    "Status": f"{emoji} {status_display}",
-                    "Data Pagamento": utils.formatar_data(anu['data_pagamento']) if anu['data_pagamento'] else "-"
-                })
-            
-            df_tabela = pd.DataFrame(dados_tabela)
-            
-            def colorir_linhas(row):
-                if '⛔' in str(row['Status']):
-                    return ['background-color: #e6e6e6'] * len(row)
-                elif '❌' in str(row['Status']):
-                    return ['background-color: #ffcccc'] * len(row)
-                elif '⚠️' in str(row['Status']):
-                    return ['background-color: #ffffcc'] * len(row)
-                elif '✅' in str(row['Status']):
-                    return ['background-color: #ccffcc'] * len(row)
-                elif '💰' in str(row['Status']):
-                    return ['background-color: #ccddff'] * len(row)
-                else:
-                    return [''] * len(row)
-            
-            st.dataframe(
-                df_tabela.style.apply(colorir_linhas, axis=1),
-                use_container_width=True,
-                hide_index=True
-            )
-            
-            st.divider()
-            
-            st.subheader("💰 Registrar Pagamento / Marcar Anuidade")
-            
-            col1, col2, col3, col4 = st.columns(4)
-            
-            with col1:
-                num_anuidade = st.selectbox(
-                    "Selecione a anuidade",
-                    anuidades['numero_anuidade'].tolist(),
-                    key="select_anuidade"
-                )
-            
-            with col2:
-                data_pagamento_input = st.date_input(
-                    "Data do Pagamento",
-                    key="data_pag"
-                )
-            
-            with col3:
-                if st.button("✅ Registrar Pagamento", use_container_width=True):
-                    db.atualizar_status_anuidade(
-                        patente_id,
-                        num_anuidade,
-                        "pago",
-                        data_pagamento_input.strftime("%Y-%m-%d")
-                    )
-                    st.success("✅ Pagamento registrado com sucesso!")
-                    st.rerun()
-            
-            with col4:
-                if st.button("🚫 Marcar Não Pagar", use_container_width=True):
-                    db.atualizar_status_anuidade(
-                        patente_id,
-                        num_anuidade,
-                        "nao_pagar"
-                    )
-                    st.success("✅ Anuidade marcada como não pagar!")
-                    st.rerun()
-        
-        st.divider()
-        
-        if st.button("🗑️ Deletar Patente", use_container_width=True, type="secondary"):
-            if st.checkbox("Tenho certeza que desejo deletar esta patente?"):
-                db.deletar_patente(patente_id)
-                st.success("✅ Patente deletada com sucesso!")
-                st.rerun()
-
-elif pagina == "📤 Importar Excel":
-    st.title("📤 Importar Patentes do Excel")
-    
-    st.info("""
-    📋 O arquivo Excel deve conter as seguintes colunas:
-    - **numero_patente** (obrigatorio)
-    - **data_deposito** (obrigatorio, formato: DD/MM/YYYY ou YYYY-MM-DD)
-    - **data_concessao** (opcional)
-    - **descricao** (opcional)
-    - **titular** (opcional)
-    - **gestor** (opcional) - Se diferente de IFSC, marcar anuidades como não pagar
-    - **status** (opcional) - Se contiver: indeferido, arquivado ou desistência, marcar anuidades como não pagar
-    """)
-    
-    arquivo_excel = st.file_uploader(
-        "Selecione um arquivo Excel (.xlsx)",
-        type="xlsx"
-    )
-    
-    if arquivo_excel:
-        st.subheader("🔎 Conferência da planilha")
-        problemas = db.analisar_inconsistencias_excel(arquivo_excel)
-        for problema in problemas:
-            st.warning(problema)
-        arquivo_excel.seek(0)
-
-        if st.button("📥 Importar Dados", use_container_width=True, type="primary"):
-            with st.spinner("Importando dados..."):
-                resultados = db.importar_excel(arquivo_excel)
-            
-            st.subheader("📊 Resultado da Importacao")
-            
-            sucesso_count = sum(1 for _, sucesso, _ in resultados if sucesso)
-            erro_count = len(resultados) - sucesso_count
-            
-            col1, col2 = st.columns(2)
-            with col1:
-                st.metric("✅ Importadas com Sucesso", sucesso_count)
-            with col2:
-                st.metric("❌ Erros", erro_count)
-            
-            dados_resultados = []
-            for patente, sucesso, mensagem in resultados:
-                dados_resultados.append({
-                    "Patente": patente,
-                    "Status": "✅ Sucesso" if sucesso else "❌ Erro",
-                    "Mensagem": mensagem
-                })
-            
-            df_resultados = pd.DataFrame(dados_resultados)
-            st.dataframe(df_resultados, use_container_width=True, hide_index=True)
-            
-            if sucesso_count > 0:
-                st.success(f"🎉 {sucesso_count} patente(s) importada(s) com sucesso!")
-                st.balloons()
-
-elif pagina == "🤖 Análise IA":
-    st.title("🤖 Análise Inteligente de Patentes")
-    st.markdown("""Utilize a IA para fazer perguntas e análises sobre suas patentes.""")
-    
-    df_patentes = db.obter_patentes()
-    
-    if len(df_patentes) == 0:
-        st.warning("⚠️ Nenhuma patente cadastrada. Primeiro, adicione algumas patentes.")
-    else:
-        st.divider()
-        
-        col1, col2 = st.columns([3, 1])
-        
-        with col1:
-            pergunta = st.text_input(
-                "Faça uma pergunta sobre suas patentes:",
-                placeholder="Ex: Quantas patentes foram concedidas? Quais estão vencidas? Qual é o status das patentes do IFSC?"
-            )
-        
-        with col2:
-            analizar = st.button("🔍 Analisar", use_container_width=True)
-        
-        if analizar and pergunta:
-            with st.spinner("Analisando dados..."):
-                resposta = ai_analyzer.analisar_pergunta(df_patentes, pergunta)
-                st.markdown("### 📋 Resposta:")
-                st.info(resposta)
-        
-        st.divider()
-        
-        st.subheader("📊 Análises Rápidas")
-        
-        col1, col2, col3 = st.columns(3)
-        
-        with col1:
-            if st.button("📈 Estatísticas Gerais", use_container_width=True):
-                stats = ai_analyzer.gerar_estatisticas(df_patentes)
-                st.markdown(stats)
-        
-        with col2:
-            if st.button("🎯 Patentes por Gestor", use_container_width=True):
-                gestores = ai_analyzer.patentes_por_gestor(df_patentes)
-                st.markdown(gestores)
-        
-        with col3:
-            if st.button("⚠️ Alertas Urgentes", use_container_width=True):
-                alertas = ai_analyzer.gerar_alertas(df_patentes)
-                st.markdown(alertas)
-
-elif pagina == "📄 Gerar Relatórios":
-    st.title("📄 Relatórios e Exportação")
-    df_patentes = db.obter_patentes()
-    if len(df_patentes) == 0:
-        st.warning("⚠️ Nenhuma patente cadastrada.")
-    else:
-        st.subheader("📄 Relatórios PDF")
-        c1,c2,c3=st.columns(3)
-        with c1:
-            if st.button("📋 Relatório Completo",use_container_width=True):
-                pdf=report_generator.gerar_relatorio_completo(df_patentes); st.download_button("📥 Baixar PDF Completo",pdf,file_name="relatorio_completo.pdf",mime="application/pdf")
-        with c2:
-            if st.button("📊 Relatório de Anuidades",use_container_width=True):
-                pdf=report_generator.gerar_relatorio_anuidades(df_patentes); st.download_button("📥 Baixar PDF de Anuidades",pdf,file_name="relatorio_anuidades.pdf",mime="application/pdf")
-        with c3:
-            if st.button("⚠️ Relatório de Alertas",use_container_width=True):
-                pdf=report_generator.gerar_relatorio_alertas(df_patentes); st.download_button("📥 Baixar PDF de Alertas",pdf,file_name="relatorio_alertas.pdf",mime="application/pdf")
-        st.divider(); st.subheader("📤 Exportação personalizada por colunas e filtros")
-        tipo=st.radio("Base para exportação",["Patentes","Anuidades"],horizontal=True)
-        busca=st.text_input("🔎 Busca geral",placeholder="Número, título, inventor, titular, gestor, campus...")
-        gestores=sorted([x for x in df_patentes["gestor"].dropna().astype(str).unique() if x]); status_patentes=sorted([x for x in df_patentes["status"].dropna().astype(str).unique() if x]); campi=sorted([x for x in df_patentes["campus"].dropna().astype(str).unique() if x])
-        c1,c2,c3,c4=st.columns(4)
-        with c1: filtro_gestor=st.multiselect("Gestor",gestores)
-        with c2: filtro_status=st.multiselect("Status da Patente",status_patentes)
-        with c3: filtro_campus=st.multiselect("Campus",campi)
-        with c4: filtro_anuidade=st.multiselect("Status da Anuidade",["pendente","pago","nao_pagar"]) if tipo=="Anuidades" else []
-        dados=db.obter_dados_exportacao(tipo,busca,filtro_gestor,filtro_status,filtro_campus,filtro_anuidade)
-        if dados.empty: st.warning("Nenhum registro atende aos filtros.")
-        else:
-            mapa=db.COLUNAS_PATENTES if tipo=="Patentes" else db.COLUNAS_ANUIDADES; opcoes=[c for c in mapa if c in dados.columns]
-            selecionadas=st.multiselect("Selecione as colunas (a ordem escolhida será mantida)",opcoes,default=opcoes,format_func=lambda x:mapa[x])
-            if selecionadas:
-                export_df=db.preparar_exportacao(dados,selecionadas); st.caption(f"{len(export_df)} registro(s) × {len(export_df.columns)} coluna(s)"); st.dataframe(export_df,use_container_width=True,hide_index=True)
-                excel=db.dataframe_para_excel(export_df,tipo); csv=db.dataframe_para_csv(export_df); c1,c2=st.columns(2)
-                with c1: st.download_button("📥 Baixar Excel selecionado",excel,file_name=f"{tipo.lower()}_selecionado.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True)
-                with c2: st.download_button("📥 Baixar CSV selecionado",csv,file_name=f"{tipo.lower()}_selecionado.csv",mime="text/csv",use_container_width=True)
+def exportar_para_excel(df): return dataframe_para_excel(df,'Patentes')
+def exportar_para_csv(df): return dataframe_para_csv(df)
