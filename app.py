@@ -59,117 +59,92 @@ if pagina == "📊 Dashboard":
         st.info("📭 Nenhuma patente cadastrada ainda. Adicione uma patente para começar!")
     else:
         total_patentes = len(df_patentes)
-        
-        alertas_verde = 0
-        alertas_amarelo = 0
-        alertas_vermelho = 0
-        alertas_pago = 0
-        
+
+        hoje = datetime.now().date()
+
+        def data_anuidade(valor):
+            try:
+                return pd.to_datetime(valor).date()
+            except Exception:
+                return None
+
+        def dados_prazo_ordinario(anu):
+            if anu['status'] == 'nao_pagar' or anu['data_pagamento']:
+                return None
+
+            inicio_ord = data_anuidade(anu['data_inicio_ordinario'])
+            fim_ord = data_anuidade(anu['data_fim_ordinario'])
+            if not inicio_ord or not fim_ord or not (inicio_ord <= hoje <= fim_ord):
+                return None
+
+            dias_restantes = (fim_ord - hoje).days
+            status = 'amarelo' if dias_restantes <= 30 else 'verde'
+            return status, dias_restantes
+
+        dados_dashboard = []
+
         for _, patente in df_patentes.iterrows():
             anuidades = db.obter_anuidades(patente['id'])
             for _, anu in anuidades.iterrows():
-                # Verificar se está marcado como "não pagar"
-                if anu['status'] == 'nao_pagar':
+                prazo = dados_prazo_ordinario(anu)
+                if not prazo:
                     continue
-                    
-                status = utils.calcular_status_anuidade(
-                    anu['data_inicio_ordinario'],
-                    anu['data_fim_ordinario'],
-                    anu['data_inicio_extraordinario'],
-                    anu['data_fim_extraordinario'],
-                    anu['data_pagamento']
-                )
-                if status == 'verde':
-                    alertas_verde += 1
-                elif status == 'amarelo':
-                    alertas_amarelo += 1
-                elif status == 'vermelho':
-                    alertas_vermelho += 1
-                elif status == 'pago':
-                    alertas_pago += 1
-        
-        col1, col2, col3, col4, col5 = st.columns(5)
+
+                status, dias_restantes = prazo
+                emoji = utils.criar_emoji_status(status)
+                dados_dashboard.append({
+                    "ID": patente['id'],
+                    "Patente": patente['numero_patente'],
+                    "Título": patente.get('titulo') or "-",
+                    "Deposito": utils.formatar_data(patente['data_deposito']),
+                    "Status": f"{emoji} {status.upper()}",
+                    "Anuidade": anu['numero_anuidade'],
+                    "Fim Prazo Ordinário": utils.formatar_data(anu['data_fim_ordinario']),
+                    "Dias p/ Vencer": dias_restantes,
+                    "Gestor": patente.get('gestor', 'N/A'),
+                    "Campus": patente.get('campus') or "-"
+                })
+
+        alertas_verde = sum(1 for item in dados_dashboard if '✅' in item["Status"])
+        alertas_amarelo = sum(1 for item in dados_dashboard if '⚠️' in item["Status"])
+
+        col1, col2, col3, col4 = st.columns(4)
         
         with col1:
             st.metric("📚 Total de Patentes", total_patentes)
         
         with col2:
-            st.metric("✅ Normal", alertas_verde, delta="green")
+            st.metric("📅 Em Prazo Ordinário", len(dados_dashboard))
         
         with col3:
-            st.metric("⚠️ Atenção", alertas_amarelo, delta="orange")
+            st.metric("✅ Normal", alertas_verde, delta="green")
         
         with col4:
-            st.metric("❌ Vencido", alertas_vermelho, delta="red")
-        
-        with col5:
-            st.metric("💰 Pago", alertas_pago, delta="blue")
+            st.metric("⚠️ Atenção", alertas_amarelo, delta="orange")
         
         st.divider()
         
-        st.subheader("Resumo de Patentes")
-        
-        dados_dashboard = []
-        for _, patente in df_patentes.iterrows():
-            anuidades = db.obter_anuidades(patente['id'])
-            
-            anuidade_proxima = None
-            status_proxima = 'verde'
-            
-            for _, anu in anuidades.iterrows():
-                if anu['status'] == 'nao_pagar':
-                    continue
-                    
-                status = utils.calcular_status_anuidade(
-                    anu['data_inicio_ordinario'],
-                    anu['data_fim_ordinario'],
-                    anu['data_inicio_extraordinario'],
-                    anu['data_fim_extraordinario'],
-                    anu['data_pagamento']
-                )
-                if status == 'vermelho':
-                    anuidade_proxima = anu['numero_anuidade']
-                    status_proxima = 'vermelho'
-                    break
-                elif status == 'amarelo' and status_proxima != 'vermelho':
-                    anuidade_proxima = anu['numero_anuidade']
-                    status_proxima = 'amarelo'
-                elif anuidade_proxima is None:
-                    anuidade_proxima = anu['numero_anuidade']
-                    status_proxima = status
-            
-            emoji = utils.criar_emoji_status(status_proxima)
-            
-            dados_dashboard.append({
-                "ID": patente['id'],
-                "Patente": patente['numero_patente'],
-                "Título": patente.get('titulo') or "-",
-                "Deposito": utils.formatar_data(patente['data_deposito']),
-                "Status": f"{emoji} {status_proxima.upper()}",
-                "Anuidade Prox.": anuidade_proxima,
-                "Gestor": patente.get('gestor', 'N/A'),
-                "Campus": patente.get('campus') or "-"
-            })
+        st.subheader("Anuidades em Prazo Ordinário")
         
         df_dashboard = pd.DataFrame(dados_dashboard)
         
         def colorir_status(row):
-            if '❌' in str(row['Status']):
-                return ['background-color: #ffcccc'] * len(row)
-            elif '⚠️' in str(row['Status']):
+            if '⚠️' in str(row['Status']):
                 return ['background-color: #ffffcc'] * len(row)
             elif '✅' in str(row['Status']):
                 return ['background-color: #ccffcc'] * len(row)
-            elif '💰' in str(row['Status']):
-                return ['background-color: #ccddff'] * len(row)
             else:
                 return [''] * len(row)
-        
-        st.dataframe(
-            df_dashboard.style.apply(colorir_status, axis=1),
-            use_container_width=True,
-            hide_index=True
-        )
+
+        if df_dashboard.empty:
+            st.info("Nenhuma anuidade está em prazo ordinário neste momento.")
+        else:
+            df_dashboard = df_dashboard.sort_values("Dias p/ Vencer")
+            st.dataframe(
+                df_dashboard.style.apply(colorir_status, axis=1),
+                use_container_width=True,
+                hide_index=True
+            )
 
 elif pagina == "➕ Adicionar Patente":
     st.title("➕ Adicionar Nova Patente")
@@ -623,74 +598,38 @@ elif pagina == "🤖 Análise IA":
                 st.markdown(alertas)
 
 elif pagina == "📄 Gerar Relatórios":
-    st.title("📄 Geração de Relatórios em PDF")
-    
+    st.title("📄 Relatórios e Exportação")
     df_patentes = db.obter_patentes()
-    
     if len(df_patentes) == 0:
-        st.warning("⚠️ Nenhuma patente cadastrada. Primeiro, adicione algumas patentes.")
+        st.warning("⚠️ Nenhuma patente cadastrada.")
     else:
-        st.subheader("Escolha o tipo de relatório:")
-        
-        col1, col2, col3 = st.columns(3)
-        
-        with col1:
-            if st.button("📋 Relatório Completo", use_container_width=True):
-                with st.spinner("Gerando relatório completo..."):
-                    pdf = report_generator.gerar_relatorio_completo(df_patentes)
-                    st.download_button(
-                        "📥 Baixar Relatório Completo",
-                        data=pdf,
-                        file_name="relatorio_completo.pdf",
-                        mime="application/pdf"
-                    )
-        
-        with col2:
-            if st.button("📊 Relatório de Anuidades", use_container_width=True):
-                with st.spinner("Gerando relatório de anuidades..."):
-                    pdf = report_generator.gerar_relatorio_anuidades(df_patentes)
-                    st.download_button(
-                        "📥 Baixar Relatório Anuidades",
-                        data=pdf,
-                        file_name="relatorio_anuidades.pdf",
-                        mime="application/pdf"
-                    )
-        
-        with col3:
-            if st.button("⚠️ Relatório de Alertas", use_container_width=True):
-                with st.spinner("Gerando relatório de alertas..."):
-                    pdf = report_generator.gerar_relatorio_alertas(df_patentes)
-                    st.download_button(
-                        "📥 Baixar Relatório Alertas",
-                        data=pdf,
-                        file_name="relatorio_alertas.pdf",
-                        mime="application/pdf"
-                    )
-        
-        st.divider()
-        
-        st.subheader("📊 Exportação de Dados")
-        
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            if st.button("📥 Exportar para Excel", use_container_width=True):
-                excel_buffer = report_generator.exportar_para_excel(df_patentes)
-                st.download_button(
-                    "📥 Baixar Excel",
-                    data=excel_buffer,
-                    file_name="patentes_export.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
-        
-        with col2:
-            if st.button("📤 Exportar para CSV", use_container_width=True):
-                csv_buffer = report_generator.exportar_para_csv(df_patentes)
-                st.download_button(
-                    "📥 Baixar CSV",
-                    data=csv_buffer,
-                    file_name="patentes_export.csv",
-                    mime="text/csv"
-                )
-        
-
+        st.subheader("📄 Relatórios PDF")
+        c1,c2,c3=st.columns(3)
+        with c1:
+            if st.button("📋 Relatório Completo",use_container_width=True):
+                pdf=report_generator.gerar_relatorio_completo(df_patentes); st.download_button("📥 Baixar PDF Completo",pdf,file_name="relatorio_completo.pdf",mime="application/pdf")
+        with c2:
+            if st.button("📊 Relatório de Anuidades",use_container_width=True):
+                pdf=report_generator.gerar_relatorio_anuidades(df_patentes); st.download_button("📥 Baixar PDF de Anuidades",pdf,file_name="relatorio_anuidades.pdf",mime="application/pdf")
+        with c3:
+            if st.button("⚠️ Relatório de Alertas",use_container_width=True):
+                pdf=report_generator.gerar_relatorio_alertas(df_patentes); st.download_button("📥 Baixar PDF de Alertas",pdf,file_name="relatorio_alertas.pdf",mime="application/pdf")
+        st.divider(); st.subheader("📤 Exportação personalizada por colunas e filtros")
+        tipo=st.radio("Base para exportação",["Patentes","Anuidades"],horizontal=True)
+        busca=st.text_input("🔎 Busca geral",placeholder="Número, título, inventor, titular, gestor, campus...")
+        gestores=sorted([x for x in df_patentes["gestor"].dropna().astype(str).unique() if x]); status_patentes=sorted([x for x in df_patentes["status"].dropna().astype(str).unique() if x]); campi=sorted([x for x in df_patentes["campus"].dropna().astype(str).unique() if x])
+        c1,c2,c3,c4=st.columns(4)
+        with c1: filtro_gestor=st.multiselect("Gestor",gestores)
+        with c2: filtro_status=st.multiselect("Status da Patente",status_patentes)
+        with c3: filtro_campus=st.multiselect("Campus",campi)
+        with c4: filtro_anuidade=st.multiselect("Status da Anuidade",["pendente","pago","nao_pagar"]) if tipo=="Anuidades" else []
+        dados=db.obter_dados_exportacao(tipo,busca,filtro_gestor,filtro_status,filtro_campus,filtro_anuidade)
+        if dados.empty: st.warning("Nenhum registro atende aos filtros.")
+        else:
+            mapa=db.COLUNAS_PATENTES if tipo=="Patentes" else db.COLUNAS_ANUIDADES; opcoes=[c for c in mapa if c in dados.columns]
+            selecionadas=st.multiselect("Selecione as colunas (a ordem escolhida será mantida)",opcoes,default=opcoes,format_func=lambda x:mapa[x])
+            if selecionadas:
+                export_df=db.preparar_exportacao(dados,selecionadas); st.caption(f"{len(export_df)} registro(s) × {len(export_df.columns)} coluna(s)"); st.dataframe(export_df,use_container_width=True,hide_index=True)
+                excel=db.dataframe_para_excel(export_df,tipo); csv=db.dataframe_para_csv(export_df); c1,c2=st.columns(2)
+                with c1: st.download_button("📥 Baixar Excel selecionado",excel,file_name=f"{tipo.lower()}_selecionado.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True)
+                with c2: st.download_button("📥 Baixar CSV selecionado",csv,file_name=f"{tipo.lower()}_selecionado.csv",mime="text/csv",use_container_width=True)
