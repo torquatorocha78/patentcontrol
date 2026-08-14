@@ -1,78 +1,91 @@
-# database.py
 import sqlite3
 import pandas as pd
 from datetime import date
 import unicodedata
+from typing import List, Dict, Tuple, Any, Optional
 
 DB_NAME = "patentes.db"
 
 
-def conectar():
+def conectar() -> sqlite3.Connection:
+    """Retorna uma conexão configurada para o SQLite."""
     return sqlite3.connect(DB_NAME, check_same_thread=False)
 
 
-def init_database():
-    conn = conectar()
-    cur = conn.cursor()
+def init_database() -> None:
+    """Inicializa o banco de dados e aplica migrações de novas colunas."""
+    with conectar() as conn:
+        cur = conn.cursor()
 
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS patentes (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        numero_patente TEXT UNIQUE,
-        data_deposito DATE,
-        data_concessao DATE,
-        descricao TEXT,
-        titular TEXT,
-        gestor TEXT,
-        status TEXT
-    )
-    """)
+        # Criar tabela de patentes caso não exista
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS patentes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            numero_patente TEXT UNIQUE,
+            data_deposito DATE,
+            data_concessao DATE,
+            descricao TEXT,
+            titular TEXT,
+            gestor TEXT,
+            status TEXT
+        )
+        """)
 
-    colunas_existentes = {
-        row[1] for row in cur.execute("PRAGMA table_info(patentes)").fetchall()
-    }
-    novas_colunas = {
-        "titulo": "TEXT",
-        "inventores": "TEXT",
-        "campus": "TEXT",
-        "atributos": "TEXT",
-        "tipo": "TEXT",       # Patente, Software, Desenho Industrial
-        "linguagem": "TEXT"   # Apenas para Software
-    }
-    for coluna, tipo_col in novas_colunas.items():
-        if coluna not in colunas_existentes:
-            cur.execute(f"ALTER TABLE patentes ADD COLUMN {coluna} {tipo_col}")
-            if coluna == "tipo":
-                cur.execute("UPDATE patentes SET tipo = 'Patente' WHERE tipo IS NULL")
+        # Obter colunas já existentes para fazer migração dinâmica se necessário
+        colunas_existentes = {
+            row[1] for row in cur.execute("PRAGMA table_info(patentes)").fetchall()
+        }
 
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS anuidades (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        patente_id INTEGER,
-        numero_anuidade INTEGER,
-        data_inicio_ordinario DATE,
-        data_fim_ordinario DATE,
-        data_inicio_extraordinario DATE,
-        data_fim_extraordinario DATE,
-        data_pagamento DATE,
-        status TEXT,
-        FOREIGN KEY (patente_id) REFERENCES patentes(id)
-    )
-    """)
+        # Dicionário mapeando as novas colunas solicitadas
+        novas_colunas = {
+            "titulo": "TEXT",
+            "inventores": "TEXT",
+            "campus": "TEXT",
+            "atributos": "TEXT",
+            "id_externo": "TEXT",           # Coluna ID do Excel
+            "modalidade_pi": "TEXT",        # Modalidade de PI
+            "ano": "INTEGER",               # Ano
+            "data_publicacao": "DATE",      # Datada Publicação
+            "data_exame": "DATE",           # Data Exame
+            "acordo_titularidade": "TEXT",  # ACORDO DE TITULARIDADE
+            "procuracao": "TEXT",           # PROCURAÇÃO
+            "termo_cessao": "TEXT",         # TERMO DE CESSÃO
+            "ipc_classificacao": "TEXT"     # IPC- CLASSIFICAÇÃO
+        }
 
-    conn.commit()
-    conn.close()
+        # Aplica ALTER TABLE de forma segura para cada nova coluna faltante
+        for coluna, tipo in novas_colunas.items():
+            if coluna not in colunas_existentes:
+                cur.execute(f"ALTER TABLE patentes ADD COLUMN {coluna} {tipo}")
+
+        # Tabela de anuidades
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS anuidades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            patente_id INTEGER,
+            numero_anuidade INTEGER,
+            data_inicio_ordinario DATE,
+            data_fim_ordinario DATE,
+            data_inicio_extraordinario DATE,
+            data_fim_extraordinario DATE,
+            data_pagamento DATE,
+            status TEXT,
+            FOREIGN KEY (patente_id) REFERENCES patentes(id)
+        )
+        """)
+        conn.commit()
+
     garantir_anuidades_existentes()
 
 
-def obter_patentes():
-    conn = conectar()
-    df = pd.read_sql("SELECT * FROM patentes ORDER BY id", conn)
-    conn.close()
+def obter_patentes() -> pd.DataFrame:
+    """Retorna todas as patentes em um DataFrame do Pandas."""
+    with conectar() as conn:
+        df = pd.read_sql("SELECT * FROM patentes ORDER BY id", conn)
     return df
 
 
-def _valor_limpo(valor):
+def _valor_limpo(valor: Any) -> Optional[Any]:
     if pd.isna(valor):
         return None
     if isinstance(valor, str):
@@ -81,18 +94,19 @@ def _valor_limpo(valor):
     return valor
 
 
-def _normalizar_coluna(coluna):
+def _normalizar_coluna(coluna: str) -> str:
+    """Normaliza nomes de colunas removendo acentos, pontuações e espaçamentos."""
     texto = str(coluna).strip().lower()
     texto = "".join(
         c for c in unicodedata.normalize("NFKD", texto)
         if not unicodedata.combining(c)
     )
-    for char in ["/", "\\", "-", ".", "(", ")", ":", ";"]:
+    for char in ["/", "\\", "-", ".", "(", ")", ":", ";", "_"]:
         texto = texto.replace(char, " ")
     return "_".join(texto.split())
 
 
-def _normalizar_status(status):
+def _normalizar_status(status: Any) -> str:
     status = _valor_limpo(status)
     if not status:
         return "Ativo"
@@ -103,18 +117,20 @@ def _normalizar_status(status):
         "patente_concedida": "Patente Concedida",
         "patente_concedda": "Patente Concedida",
         "concedido": "Patente Concedida",
+        "concessao": "Patente Concedida",
         "tramitando_normal": "Tramitando Normal",
         "infederimento": "Indeferimento",
         "indeferimento": "Indeferimento",
         "recurso_contra_indeferimento": "Recurso contra indeferimento",
         "pedido_de_exame": "Pedido de exame",
         "transferida_a_titularidade": "Transferida a titularidade",
+        "arquivado": "Arquivado",
+        "desistencia": "Desistência"
     }
     return mapa.get(chave, status_texto)
 
 
-def _parse_data(valor):
-    # Trata datas vindas do Excel ou inputs
+def _parse_data(valor: Any) -> Optional[str]:
     valor = _valor_limpo(valor)
     if valor is None:
         return None
@@ -138,32 +154,98 @@ def _parse_data(valor):
         return texto
 
 
-def _calcular_datas_anuidade(data_dep, numero_anuidade, tipo='Patente'):
+def adicionar_patente(
+    numero: str,
+    data_dep: str,
+    data_conc: Optional[str],
+    descricao: Optional[str],
+    titular: Optional[str],
+    gestor: Optional[str] = None,
+    status_patente: str = "Ativo",
+    titulo: Optional[str] = None,
+    inventores: Optional[str] = None,
+    campus: Optional[str] = None,
+    atributos: Optional[str] = None,
+    id_externo: Optional[str] = None,
+    modalidade_pi: Optional[str] = None,
+    ano: Optional[int] = None,
+    data_publicacao: Optional[str] = None,
+    data_exame: Optional[str] = None,
+    acordo_titularidade: Optional[str] = None,
+    procuracao: Optional[str] = None,
+    termo_cessao: Optional[str] = None,
+    ipc_classificacao: Optional[str] = None
+) -> Tuple[bool, str]:
+    """Insere uma patente e gera suas 20 anuidades usando uma única transação rápida."""
+    conn = conectar()
+    cur = conn.cursor()
+
+    try:
+        # Início da transação explícita
+        cur.execute("BEGIN TRANSACTION")
+
+        cur.execute(
+            """
+            INSERT INTO patentes
+            (numero_patente, data_deposito, data_concessao, descricao, titular, gestor, status,
+             titulo, inventores, campus, atributos, id_externo, modalidade_pi, ano, 
+             data_publicacao, data_exame, acordo_titularidade, procuracao, termo_cessao, ipc_classificacao)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                numero, data_dep, data_conc, descricao, titular, gestor, _normalizar_status(status_patente),
+                titulo, inventores, campus, atributos, id_externo, modalidade_pi, ano,
+                data_publicacao, data_exame, acordo_titularidade, procuracao, termo_cessao, ipc_classificacao
+            ),
+        )
+        patente_id = cur.lastrowid
+
+        # Geração em lote das 20 anuidades na mesma transação
+        inicio = pd.to_datetime(data_dep)
+        lote_anuidades = []
+        for i in range(1, 21):
+            ini_ord = inicio + pd.DateOffset(years=i - 1)
+            fim_ord = ini_ord + pd.DateOffset(months=3)
+            ini_ext = fim_ord
+            fim_ext = ini_ext + pd.DateOffset(months=3)
+
+            lote_anuidades.append((
+                patente_id, i, ini_ord.date().isoformat(), fim_ord.date().isoformat(),
+                ini_ext.date().isoformat(), fim_ext.date().isoformat(), "pendente"
+            ))
+
+        cur.executemany(
+            """
+            INSERT INTO anuidades
+            (patente_id, numero_anuidade, data_inicio_ordinario, data_fim_ordinario,
+             data_inicio_extraordinario, data_fim_extraordinario, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            lote_anuidades
+        )
+
+        conn.commit()
+        return True, "Patente cadastrada com sucesso"
+
+    except Exception as e:
+        conn.rollback()
+        return False, f"Erro ao adicionar patente: {str(e)}"
+    finally:
+        conn.close()
+
+
+def _calcular_datas_anuidade(data_dep: str, numero_anuidade: int) -> Tuple[date, date, date, date]:
     inicio = pd.to_datetime(data_dep)
-
-    if tipo == 'Software':
-        # Software tem apenas uma taxa única (número 1) logo no início
-        ini_ord = inicio
-    elif tipo == 'Desenho Industrial':
-        # Desenho Industrial: cobranças em quinquênios (0, 5, 10, 15, 20 anos)
-        anos_deslocamento = 5 * (numero_anuidade - 1)
-        ini_ord = inicio + pd.DateOffset(years=anos_deslocamento)
-    else:
-        # Patente normal: anuidades anuais convencionais
-        ini_ord = inicio + pd.DateOffset(years=numero_anuidade - 1)
-
+    ini_ord = inicio + pd.DateOffset(years=numero_anuidade - 1)
     fim_ord = ini_ord + pd.DateOffset(months=3)
     ini_ext = fim_ord
     fim_ext = ini_ext + pd.DateOffset(months=3)
-
     return ini_ord.date(), fim_ord.date(), ini_ext.date(), fim_ext.date()
 
 
-def _garantir_anuidades_patente(cur, patente_id, data_dep, tipo='Patente'):
+def _garantir_anuidades_patente(cur: sqlite3.Cursor, patente_id: int, data_dep: str) -> None:
     if not data_dep:
         return
-    if not tipo:
-        tipo = 'Patente'
 
     cur.execute(
         "SELECT numero_anuidade FROM anuidades WHERE patente_id = ?",
@@ -171,229 +253,165 @@ def _garantir_anuidades_patente(cur, patente_id, data_dep, tipo='Patente'):
     )
     existentes = {row[0] for row in cur.fetchall()}
 
-    # Define o limite de pagamentos/períodos dependendo do tipo do ativo
-    if tipo == 'Software':
-        limite_taxas = 1
-    elif tipo == 'Desenho Industrial':
-        limite_taxas = 5  # 5 quinquênios cobrindo 25 anos de validade máxima
-    else:
-        limite_taxas = 20  # 20 anos de patentes ordinárias
-
-    for numero_anuidade in range(1, limite_taxas + 1):
+    lote_inserir = []
+    for numero_anuidade in range(1, 21):
         if numero_anuidade in existentes:
             continue
 
-        ini_ord, fim_ord, ini_ext, fim_ext = _calcular_datas_anuidade(
-            data_dep,
-            numero_anuidade,
-            tipo
-        )
-        cur.execute(
+        ini_ord, fim_ord, ini_ext, fim_ext = _calcular_datas_anuidade(data_dep, numero_anuidade)
+        lote_inserir.append((
+            patente_id, numero_anuidade, ini_ord.isoformat(), fim_ord.isoformat(),
+            ini_ext.isoformat(), fim_ext.isoformat(), "pendente"
+        ))
+
+    if lote_inserir:
+        cur.executemany(
             """
             INSERT INTO anuidades
-            (patente_id, numero_anuidade,
-             data_inicio_ordinario, data_fim_ordinario,
-             data_inicio_extraordinario, data_fim_extraordinario,
-             status)
+            (patente_id, numero_anuidade, data_inicio_ordinario, data_fim_ordinario,
+             data_inicio_extraordinario, data_fim_extraordinario, status)
             VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (
-                patente_id,
-                numero_anuidade,
-                ini_ord,
-                fim_ord,
-                ini_ext,
-                fim_ext,
-                "pendente",
-            ),
+            lote_inserir
         )
 
 
-def garantir_anuidades_existentes():
-    conn = conectar()
-    cur = conn.cursor()
+def garantir_anuidades_existentes() -> None:
+    """Verifica e cria anuidades faltantes para todas as patentes registradas."""
+    with conectar() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT id, data_deposito FROM patentes")
+        patentes = cur.fetchall()
 
-    cur.execute("SELECT id, data_deposito, tipo FROM patentes")
-    patentes = cur.fetchall()
-
-    for patente_id, data_dep, tipo in patentes:
-        _garantir_anuidades_patente(cur, patente_id, data_dep, tipo or 'Patente')
-
-    conn.commit()
-    conn.close()
+        for patente_id, data_dep in patentes:
+            if data_dep:
+                _garantir_anuidades_patente(cur, patente_id, data_dep)
+        conn.commit()
 
 
-def adicionar_patente(
-    numero,
-    data_dep,
-    data_conc,
-    descricao,
-    titular,
-    gestor=None,
-    status_patente='Ativo',
-    titulo=None,
-    inventores=None,
-    campus=None,
-    atributos=None,
-    tipo='Patente',
-    linguagem=None
-):
-    conn = conectar()
-    cur = conn.cursor()
+def atualizar_patente(
+    patente_id: int,
+    numero: str,
+    data_dep: str,
+    data_conc: Optional[str],
+    descricao: Optional[str],
+    titular: Optional[str],
+    gestor: Optional[str] = None,
+    status_patente: str = "Ativo",
+    titulo: Optional[str] = None,
+    inventores: Optional[str] = None,
+    campus: Optional[str] = None,
+    atributos: Optional[str] = None,
+    id_externo: Optional[str] = None,
+    modalidade_pi: Optional[str] = None,
+    ano: Optional[int] = None,
+    data_publicacao: Optional[str] = None,
+    data_exame: Optional[str] = None,
+    acordo_titularidade: Optional[str] = None,
+    procuracao: Optional[str] = None,
+    termo_cessao: Optional[str] = None,
+    ipc_classificacao: Optional[str] = None
+) -> Tuple[bool, str]:
+    """Atualiza de forma robusta todos os dados de uma patente existente."""
+    with conectar() as conn:
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                UPDATE patentes
+                SET numero_patente = ?, data_deposito = ?, data_concessao = ?,
+                    descricao = ?, titular = ?, gestor = ?, status = ?,
+                    titulo = ?, inventores = ?, campus = ?, atributos = ?,
+                    id_externo = ?, modalidade_pi = ?, ano = ?, data_publicacao = ?,
+                    data_exame = ?, acordo_titularidade = ?, procuracao = ?,
+                    termo_cessao = ?, ipc_classificacao = ?
+                WHERE id = ?
+                """,
+                (
+                    numero, data_dep, data_conc, descricao, titular, gestor, _normalizar_status(status_patente),
+                    titulo, inventores, campus, atributos, id_externo, modalidade_pi, ano,
+                    data_publicacao, data_exame, acordo_titularidade, procuracao, termo_cessao, ipc_classificacao,
+                    patente_id
+                ),
+            )
+            conn.commit()
+            return True, "Patente atualizada com sucesso"
+        except Exception as e:
+            return False, f"Erro ao atualizar patente: {str(e)}"
 
-    try:
+
+def salvar_patente_importada(dados: Dict[str, Any], cur: sqlite3.Cursor) -> Tuple[bool, str]:
+    """Salva ou atualiza a patente diretamente usando o cursor da transação ativa."""
+    cur.execute("SELECT id FROM patentes WHERE numero_patente = ?", (dados["numero"],))
+    existente = cur.fetchone()
+
+    if existente:
+        patente_id = existente[0]
+        cur.execute(
+            """
+            UPDATE patentes
+            SET data_deposito = ?, data_concessao = ?, descricao = ?, titular = ?, gestor = ?, status = ?,
+                titulo = ?, inventores = ?, campus = ?, atributos = ?, id_externo = ?, modalidade_pi = ?,
+                ano = ?, data_publicacao = ?, data_exame = ?, acordo_titularidade = ?, procuracao = ?,
+                termo_cessao = ?, ipc_classificacao = ?
+            WHERE id = ?
+            """,
+            (
+                dados["data_dep"], dados["data_conc"], dados["descricao"], dados["titular"], dados["gestor"],
+                _normalizar_status(dados["status_patente"]), dados["titulo"], dados["inventores"], dados["campus"],
+                dados["atributos"], dados["id_externo"], dados["modalidade_pi"], dados["ano"], dados["data_publicacao"],
+                dados["data_exame"], dados["acordo_titularidade"], dados["procuracao"], dados["termo_cessao"],
+                dados["ipc_classificacao"], patente_id
+            )
+        )
+        # Garante que as anuidades existem para o registro atualizado
+        _garantir_anuidades_patente(cur, patente_id, dados["data_dep"])
+        return True, "Patente existente atualizada"
+    else:
         cur.execute(
             """
             INSERT INTO patentes
             (numero_patente, data_deposito, data_concessao, descricao, titular, gestor, status,
-             titulo, inventores, campus, atributos, tipo, linguagem)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             titulo, inventores, campus, atributos, id_externo, modalidade_pi, ano, 
+             data_publicacao, data_exame, acordo_titularidade, procuracao, termo_cessao, ipc_classificacao)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                numero,
-                data_dep,
-                data_conc,
-                descricao,
-                titular,
-                gestor,
-                _normalizar_status(status_patente),
-                titulo,
-                inventores,
-                campus,
-                atributos,
-                tipo,
-                linguagem
-            ),
+                dados["numero"], dados["data_dep"], dados["data_conc"], dados["descricao"], dados["titular"], dados["gestor"],
+                _normalizar_status(dados["status_patente"]), dados["titulo"], dados["inventores"], dados["campus"],
+                dados["atributos"], dados["id_externo"], dados["modalidade_pi"], dados["ano"], dados["data_publicacao"],
+                dados["data_exame"], dados["acordo_titularidade"], dados["procuracao"], dados["termo_cessao"],
+                dados["ipc_classificacao"]
+            )
         )
         patente_id = cur.lastrowid
-
-        # Gera taxas respectivas de forma isolada
-        _garantir_anuidades_patente(cur, patente_id, data_dep, tipo)
-
-        conn.commit()
-        return True, "Ativo cadastrado com sucesso!"
-
-    except Exception as e:
-        return False, str(e)
-    finally:
-        conn.close()
+        _garantir_anuidades_patente(cur, patente_id, dados["data_dep"])
+        return True, "Nova patente importada"
 
 
-def atualizar_patente(
-    patente_id,
-    numero,
-    data_dep,
-    data_conc,
-    descricao,
-    titular,
-    gestor=None,
-    status_patente="Ativo",
-    titulo=None,
-    inventores=None,
-    campus=None,
-    atributos=None,
-    tipo="Patente",
-    linguagem=None
-):
-    conn = conectar()
-    cur = conn.cursor()
-    try:
-        # Busca tipo e data atuais antes da modificação
-        cur.execute("SELECT tipo, data_deposito FROM patentes WHERE id = ?", (patente_id,))
-        antigo = cur.fetchone()
-
-        cur.execute(
-            """
-            UPDATE patentes
-            SET numero_patente = ?, data_deposito = ?, data_concessao = ?,
-                descricao = ?, titular = ?, gestor = ?, status = ?,
-                titulo = ?, inventores = ?, campus = ?, atributos = ?,
-                tipo = ?, linguagem = ?
-            WHERE id = ?
-            """,
-            (
-                numero,
-                data_dep,
-                data_conc,
-                descricao,
-                titular,
-                gestor,
-                _normalizar_status(status_patente),
-                titulo,
-                inventores,
-                campus,
-                atributos,
-                tipo,
-                linguagem,
-                patente_id,
-            ),
-        )
-
-        # Se houver alteração crítica (tipo de ativo ou data de depósito), recalculamos
-        if antigo:
-            antigo_tipo, antiga_data = antigo
-            if antigo_tipo != tipo or antiga_data != data_dep:
-                cur.execute("DELETE FROM anuidades WHERE patente_id = ?", (patente_id,))
-                _garantir_anuidades_patente(cur, patente_id, data_dep, tipo)
-
-        conn.commit()
-        return True, "Ativo atualizado com sucesso!"
-    except Exception as e:
-        return False, str(e)
-    finally:
-        conn.close()
-
-
-def salvar_patente_importada(dados):
-    conn = conectar()
-    cur = conn.cursor()
-    try:
-        cur.execute(
-            "SELECT id FROM patentes WHERE numero_patente = ?",
-            (dados["numero"],),
-        )
-        existente = cur.fetchone()
-    finally:
-        conn.close()
-
-    if existente:
-        ok, msg = atualizar_patente(existente[0], **dados)
-        return ok, "Atualizada: " + msg if ok else msg
-
-    ok, msg = adicionar_patente(**dados)
-    return ok, "Importada: " + msg if ok else msg
-
-
-def obter_anuidades(patente_id):
+def obter_anuidades(patente_id: int) -> pd.DataFrame:
     patente_id = int(patente_id)
-    conn = conectar()
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT data_deposito, tipo FROM patentes WHERE id = ?",
-        (patente_id,),
-    )
-    patente = cur.fetchone()
-    if patente:
-        data_dep, tipo = patente
-        _garantir_anuidades_patente(cur, patente_id, data_dep, tipo or 'Patente')
-        conn.commit()
+    with conectar() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT data_deposito FROM patentes WHERE id = ?", (patente_id,))
+        patente = cur.fetchone()
+        if patente:
+            _garantir_anuidades_patente(cur, patente_id, patente[0])
+            conn.commit()
 
-    df = pd.read_sql(
-        "SELECT * FROM anuidades WHERE patente_id = ? ORDER BY numero_anuidade",
-        conn,
-        params=(patente_id,),
-    )
-    conn.close()
+        df = pd.read_sql(
+            "SELECT * FROM anuidades WHERE patente_id = ? ORDER BY numero_anuidade",
+            conn,
+            params=(patente_id,),
+        )
 
     hoje = date.today()
 
     def normalizar_status(row):
         if row.get("status"):
             s = str(row["status"]).lower()
-            if s == "nao_pagar":
-                return "nao_pagar"
-            if row.get("data_pagamento"):
-                return "pago"
+            if s in ("nao_pagar", "pago"):
+                return s
         if row.get("data_fim_extraordinario"):
             try:
                 if pd.to_datetime(row["data_fim_extraordinario"]).date() < hoje:
@@ -406,95 +424,115 @@ def obter_anuidades(patente_id):
     return df
 
 
-def atualizar_status_anuidade(patente_id, numero_anuidade, novo_status, data_pagamento=None):
+def atualizar_status_anuidade(patente_id: int, numero_anuidade: int, novo_status: str, data_pagamento: Optional[str] = None) -> None:
     patente_id = int(patente_id)
     numero_anuidade = int(numero_anuidade)
-    conn = conectar()
-    cur = conn.cursor()
-
     novo_status = novo_status.lower()
 
-    if novo_status == "pago":
-        cur.execute(
-            """
-            UPDATE anuidades
-            SET data_pagamento = ?, status = 'pago'
-            WHERE patente_id = ? AND numero_anuidade = ?
-            """,
-            (data_pagamento, patente_id, numero_anuidade),
-        )
-    elif novo_status == "nao_pagar":
-        cur.execute(
-            """
-            UPDATE anuidades
-            SET data_pagamento = NULL, status = 'nao_pagar'
-            WHERE patente_id = ? AND numero_anuidade = ?
-            """,
-            (patente_id, numero_anuidade),
-        )
-    else:
-        cur.execute(
-            """
-            UPDATE anuidades
-            SET status = ?
-            WHERE patente_id = ? AND numero_anuidade = ?
-            """,
-            (novo_status, patente_id, numero_anuidade),
-        )
+    with conectar() as conn:
+        cur = conn.cursor()
+        if novo_status == "pago":
+            cur.execute(
+                """
+                UPDATE anuidades
+                SET data_pagamento = ?, status = 'pago'
+                WHERE patente_id = ? AND numero_anuidade = ?
+                """,
+                (data_pagamento, patente_id, numero_anuidade),
+            )
+        elif novo_status == "nao_pagar":
+            cur.execute(
+                """
+                UPDATE anuidades
+                SET data_pagamento = NULL, status = 'nao_pagar'
+                WHERE patente_id = ? AND numero_anuidade = ?
+                """,
+                (patente_id, numero_anuidade),
+            )
+        else:
+            cur.execute(
+                """
+                UPDATE anuidades
+                SET status = ?
+                WHERE patente_id = ? AND numero_anuidade = ?
+                """,
+                (novo_status, patente_id, numero_anuidade),
+            )
+        conn.commit()
 
-    conn.commit()
-    conn.close()
 
-
-def deletar_patente(patente_id):
+def deletar_patente(patente_id: int) -> None:
     patente_id = int(patente_id)
+    with conectar() as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM anuidades WHERE patente_id = ?", (patente_id,))
+        cur.execute("DELETE FROM patentes WHERE id = ?", (patente_id,))
+        conn.commit()
+
+
+def importar_excel(arquivo_excel) -> List[Tuple[str, bool, str]]:
+    """Importa patentes em lote de maneira transacional e ultra rápida."""
+    resultados = []
     conn = conectar()
     cur = conn.cursor()
-    cur.execute("DELETE FROM anuidades WHERE patente_id = ?", (patente_id,))
-    cur.execute("DELETE FROM patentes WHERE id = ?", (patente_id,))
-    conn.commit()
-    conn.close()
 
-
-def importar_excel(arquivo_excel):
-    resultados = []
     try:
+        cur.execute("BEGIN TRANSACTION")
         df = pd.read_excel(arquivo_excel)
         colunas = {_normalizar_coluna(col): col for col in df.columns}
 
-        def campo(*nomes):
+        def campo(*nomes: str) -> Optional[str]:
             for nome in nomes:
                 coluna = colunas.get(_normalizar_coluna(nome))
                 if coluna is not None:
                     return coluna
             return None
 
+        # Mapeamento estrito e inteligível para capturar 100% das novas colunas informadas
         mapa = {
-            "numero": campo("numero_patente", "numero", "patente"),
-            "data_dep": campo("data_deposito", "data deposito", "deposito"),
-            "data_conc": campo("data_concessao", "concessao"),
-            "titulo": campo("titulo"),
-            "descricao": campo("resumo", "descricao"),
-            "inventores": campo("inventores", "nome dos inventores"),
-            "titular": campo("titular", "depositante"),
+            "id_externo": campo("id"),
+            "numero": campo("processo", "numero_patente", "numero de patente", "patente"),
+            "data_dep": campo("deposito", "depósito", "data_deposito", "data_depósito", "data do deposito"),
+            "data_conc": campo("data da concessao", "data da concessão", "data_concessao", "data concessao"),
+            "titulo": campo("titulo", "título"),
+            "descricao": campo("resumo", "descricao", "descrição"),
+            "inventores": campo("nome dos inventores", "inventores", "nome_dos_inventores", "nome do inventor"),
+            "titular": campo("depositante/ titular", "depositante titular", "titular", "depositante", "proprietario"),
             "gestor": campo("gestor"),
-            "status": campo("status", "situacao"),
+            "status": campo("status do pedido", "status", "situacao", "situação"),
             "campus": campo("campus"),
-            "atributos": campo("atributos"),
-            "tipo": campo("tipo", "tipo de ativo", "tipo_ativo"),
-            "linguagem": campo("linguagem", "linguagem_programacao")
+            "atributos": campo("atributos", "atributo"),
+            "modalidade_pi": campo("modalidade de pi", "modalidade pi", "modalidade"),
+            "ano": campo("ano"),
+            "data_publicacao": campo("datada publicacao", "datada publicação", "data da publicacao", "data publicacao"),
+            "data_exame": campo("data exame", "data_exame", "exame"),
+            "acordo_titularidade": campo("acordo de titularidade", "acordo titularidade"),
+            "procuracao": campo("procuracao", "procuração"),
+            "termo_cessao": campo("termo de cessao", "termo de cessão", "termo cessao"),
+            "ipc_classificacao": campo("ipc classificacao", "ipc classificação", "ipc- classificacao", "ipc- classificação", "ipc")
         }
 
-        for _, row in df.iterrows():
+        for idx, row in df.iterrows():
             numero = _valor_limpo(row.get(mapa["numero"])) if mapa["numero"] else None
             data_dep = _parse_data(row.get(mapa["data_dep"])) if mapa["data_dep"] else None
 
             if not numero or not data_dep:
-                resultados.append((numero or "SEM_NUMERO", False, "Número ou data de depósito ausente"))
+                resultados.append((
+                    str(numero or f"Linha {idx+2}"),
+                    False,
+                    "Processo (Número da Patente) ou Data de Depósito ausente."
+                ))
                 continue
 
+            # Converte com segurança campos numéricos (como Ano)
+            ano_val = row.get(mapa["ano"]) if mapa["ano"] else None
+            try:
+                ano_val = int(float(ano_val)) if pd.notna(ano_val) else None
+            except Exception:
+                ano_val = None
+
             dados = {
-                "numero": str(numero),
+                "numero": str(numero).strip(),
                 "data_dep": data_dep,
                 "data_conc": _parse_data(row.get(mapa["data_conc"])) if mapa["data_conc"] else None,
                 "descricao": _valor_limpo(row.get(mapa["descricao"])) if mapa["descricao"] else None,
@@ -505,27 +543,45 @@ def importar_excel(arquivo_excel):
                 "inventores": _valor_limpo(row.get(mapa["inventores"])) if mapa["inventores"] else None,
                 "campus": _valor_limpo(row.get(mapa["campus"])) if mapa["campus"] else None,
                 "atributos": _valor_limpo(row.get(mapa["atributos"])) if mapa["atributos"] else None,
-                "tipo": _valor_limpo(row.get(mapa["tipo"])) or "Patente",
-                "linguagem": _valor_limpo(row.get(mapa["linguagem"])) if mapa["linguagem"] else None,
+                "id_externo": _valor_limpo(str(row.get(mapa["id_externo"]))) if mapa["id_externo"] else None,
+                "modalidade_pi": _valor_limpo(row.get(mapa["modalidade_pi"])) if mapa["modalidade_pi"] else None,
+                "ano": ano_val,
+                "data_publicacao": _parse_data(row.get(mapa["data_publicacao"])) if mapa["data_publicacao"] else None,
+                "data_exame": _parse_data(row.get(mapa["data_exame"])) if mapa["data_exame"] else None,
+                "acordo_titularidade": _valor_limpo(row.get(mapa["acordo_titularidade"])) if mapa["acordo_titularidade"] else None,
+                "procuracao": _valor_limpo(row.get(mapa["procuracao"])) if mapa["procuracao"] else None,
+                "termo_cessao": _valor_limpo(row.get(mapa["termo_cessao"])) if mapa["termo_cessao"] else None,
+                "ipc_classificacao": _valor_limpo(row.get(mapa["ipc_classificacao"])) if mapa["ipc_classificacao"] else None
             }
-            ok, msg = salvar_patente_importada(dados)
-            resultados.append((numero, ok, msg))
+
+            ok, msg = salvar_patente_importada(dados, cur)
+            resultados.append((dados["numero"], ok, msg))
+
+        conn.commit()  # Commita todo o lote de uma única vez
     except Exception as e:
-        resultados.append(("ERRO_GERAL", False, str(e)))
+        conn.rollback()
+        resultados.append(("ERRO_GERAL", False, f"Falha crítica na transação: {str(e)}"))
+    finally:
+        conn.close()
 
     return resultados
 
 
-def analisar_inconsistencias_excel(arquivo_excel):
+def analisar_inconsistencias_excel(arquivo_excel) -> List[str]:
     df = pd.read_excel(arquivo_excel)
     problemas = []
 
     colunas_originais = list(df.columns)
     colunas_normalizadas = {_normalizar_coluna(col): col for col in colunas_originais}
 
-    obrigatorias = ["numero_patente", "data_deposito"]
-    for obrigatoria in obrigatorias:
-        if _normalizar_coluna(obrigatoria) not in colunas_normalizadas:
-            problemas.append(f"Coluna obrigatória não encontrada: {obrigatoria}")
+    obrigatorias = ["processo", "deposito"]
+    # Equivalentes aceitáveis
+    has_processo = "processo" in colunas_normalizadas or "numero_patente" in colunas_normalizadas or "patente" in colunas_normalizadas
+    has_deposito = "deposito" in colunas_normalizadas or "data_deposito" in colunas_normalizadas
+
+    if not has_processo:
+        problemas.append("Coluna obrigatória 'Processo' (Número da Patente) não foi encontrada.")
+    if not has_deposito:
+        problemas.append("Coluna obrigatória 'Depósito' (Data de Depósito) não foi encontrada.")
 
     return problemas
